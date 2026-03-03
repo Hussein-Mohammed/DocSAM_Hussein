@@ -1,5 +1,9 @@
-
 import os
+
+# Windows OpenMP runtime guard (libomp/libiomp duplicate load)
+if os.name == "nt":
+    os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
 import timeit
 import random
 from tqdm import tqdm
@@ -9,16 +13,9 @@ import math
 import json
 import copy
 import numpy as np
+
 np.set_printoptions(linewidth=400)
 np.set_printoptions(precision=4)
-
-import cv2
-from PIL import Image as PILImage
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
-from pycocotools.coco import COCO
-from pycocotools.cocoeval import COCOeval
-import pycocotools.mask as mask_utils
-from scipy.optimize import linear_sum_assignment
 
 import gc
 import torch
@@ -29,14 +26,20 @@ from torchvision.ops import box_iou
 from torch.nn.utils.rnn import pad_sequence
 from prefetch_generator import BackgroundGenerator
 
+import cv2
+from PIL import Image as PILImage
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
+from pycocotools.coco import COCO
+from pycocotools.cocoeval import COCOeval
+import pycocotools.mask as mask_utils
+from scipy.optimize import linear_sum_assignment
+
 from datasets.dataset import DocSAM_GT
-from models.DocSAM import DocSAM 
+from models.DocSAM import DocSAM
 
 from itertools import accumulate
 import torch.multiprocessing as mp
 from torch.utils.data import Subset
-
-
 
 STAGE = "test"
 MODEL_SIZE = "base"
@@ -70,7 +73,7 @@ def str2bool(input_str):
         argparse.ArgumentTypeError: If the input string does not match any 
                                     of the accepted boolean representations.
     """
-    
+
     if input_str.lower() in ('yes', 'true', 't', 'y', '1'):
         return True
     elif input_str.lower() in ('no', 'false', 'f', 'n', '0'):
@@ -111,15 +114,17 @@ def get_arguments():
     """
 
     parser = argparse.ArgumentParser(description="LPN-ResNet Network")
-    
+
     parser.add_argument('--stage', type=str, default="test", help='Test or inference.')
     parser.add_argument('--model-size', type=str, default=MODEL_SIZE, help='Model size: tiny, small, base, large.')
     parser.add_argument("--eval-path", type=str, nargs='+', help='A list of evaluation paths')
     parser.add_argument("--save-path", type=str, default=SAVE_PATH, help='Path to save outputs')
     parser.add_argument("--short-range", type=parse_tuple, default=SHORT_RANGE, help='Short side range')
-    parser.add_argument("--patch-size", type=parse_tuple, default=PATCH_SIZE, help='Patch size sampled from each image during training')
+    parser.add_argument("--patch-size", type=parse_tuple, default=PATCH_SIZE,
+                        help='Patch size sampled from each image during training')
     parser.add_argument("--patch-num", type=int, default=PATCH_NUM, help='Patch number')
-    parser.add_argument("--keep-size", type=str2bool, default=KEEP_SIZE, help='Whether to keep original image size (True/False)')
+    parser.add_argument("--keep-size", type=str2bool, default=KEEP_SIZE,
+                        help='Whether to keep original image size (True/False)')
     parser.add_argument('--max-num', type=int, default=MAX_NUM, help='Max image num for evaluation.')
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, help='Batch size for processing')
     parser.add_argument("--restore-from", type=str, default=RESTORE_FROM, help='Path to restore model from')
@@ -155,16 +160,17 @@ class CustomSubset(Subset):
     Attributes:
         collate_fn (callable): The collate function from the parent dataset, if it exists.
     """
+
     def __init__(self, dataset, indices):
         super().__init__(dataset, indices)
         self.collate_fn = getattr(dataset, "collate_fn", None)
-        
-        
+
+
 class DataLoaderX(DataLoader):
     """
     Custom DataLoader that uses a background generator to load data asynchronously.
     """
-    
+
     def __iter__(self):
         return BackgroundGenerator(super().__iter__())
 
@@ -181,9 +187,9 @@ def get_instance_palette(num_cls=2):
     """
 
     palette = [0] * (num_cls * 3)
-    palette[0:3] = (0, 0, 0)        # 0: 'background' 
+    palette[0:3] = (0, 0, 0)  # 0: 'background'
     for i in range(num_cls * 3 - 3):
-        palette[i+3] = random.randint(0, 255)
+        palette[i + 3] = random.randint(0, 255)
 
     return palette
 
@@ -202,9 +208,9 @@ def id_map_to_color(id_map, palette):
 
     hei, wid = id_map.shape[0], id_map.shape[1]
     color_map = np.zeros((hei, wid, 3), np.uint8)
-    for i in range(0, id_map.max()+1):
-        color_map[id_map==i, :] = palette[3*i:3*i+3]
-    
+    for i in range(0, id_map.max() + 1):
+        color_map[id_map == i, :] = palette[3 * i:3 * i + 3]
+
     return color_map
 
 
@@ -240,24 +246,24 @@ def mask_bbox(masks, img_shape=None, is_norm=False):
     """
 
     Q, H, W = masks.shape
-    
-    x_projection = masks.any(dim=-2)    # [Q, W]
-    y_projection = masks.any(dim=-1)    # [Q, H]
-    
+
+    x_projection = masks.any(dim=-2)  # [Q, W]
+    y_projection = masks.any(dim=-1)  # [Q, H]
+
     x1 = (x_projection.cumsum(dim=-1) == 1).float().argmax(dim=-1)
     x2 = W - 1 - ((x_projection.flip([-1])).cumsum(dim=-1) == 1).float().argmax(dim=-1)
-    
+
     y1 = (y_projection.cumsum(dim=-1) == 1).float().argmax(dim=-1)
     y2 = H - 1 - ((y_projection.flip([-1])).cumsum(dim=-1) == 1).float().argmax(dim=-1)
     bboxes = torch.stack([x1, y1, x2, y2], dim=-1).float()
-        
+
     if is_norm:
-        bboxes[...,[0,2]] = bboxes[...,[0,2]] / W
-        bboxes[...,[1,3]] = bboxes[...,[1,3]] / H
+        bboxes[..., [0, 2]] = bboxes[..., [0, 2]] / W
+        bboxes[..., [1, 3]] = bboxes[..., [1, 3]] / H
     elif img_shape is not None:
-        bboxes[...,[0,2]] = bboxes[...,[0,2]] / W * img_shape[-1]
-        bboxes[...,[1,3]] = bboxes[...,[1,3]] / H * img_shape[-2]
-            
+        bboxes[..., [0, 2]] = bboxes[..., [0, 2]] / W * img_shape[-1]
+        bboxes[..., [1, 3]] = bboxes[..., [1, 3]] / H * img_shape[-2]
+
     return bboxes
 
 
@@ -277,14 +283,14 @@ def mask_iou(masks1, masks2, scale_factor=None):
     if scale_factor is not None:
         masks1 = F.interpolate(masks1[None].float(), scale_factor=scale_factor, mode="bilinear", align_corners=False)[0]
         masks2 = F.interpolate(masks2[None].float(), scale_factor=scale_factor, mode="bilinear", align_corners=False)[0]
-        
+
     masks1 = masks1.float().flatten(1)
     masks2 = masks2.float().flatten(1)
-    
+
     numerator = torch.matmul(masks1, masks2.T)
     denominator = masks1.sum(-1)[:, None] + masks2.sum(-1)[None, :] - numerator
     ious = numerator / denominator.clamp(min=1)
-    
+
     return ious
 
 
@@ -304,26 +310,26 @@ def mask_iou_group_wise(masks1, masks2, scale_factor=None, group_size1=8, group_
     """
 
     ious = torch.zeros(masks1.size(0), masks2.size(0))
-    
+
     group_num1 = math.ceil(masks1.size(0) / group_size1)
     group_num2 = math.ceil(masks2.size(0) / group_size2)
     for i in range(group_num1):
         start1 = i * group_size1
         end1 = min(start1 + group_size1, masks1.size(0))
-        sub_masks1 = masks1[start1:end1,...]
+        sub_masks1 = masks1[start1:end1, ...]
         for j in range(group_num2):
             start2 = j * group_size2
             end2 = min(start2 + group_size2, masks2.size(0))
-            sub_masks2 = masks2[start2:end2,...]
+            sub_masks2 = masks2[start2:end2, ...]
             sub_ious = mask_iou(sub_masks1, sub_masks2, scale_factor)
             ious[start1:end1, start2:end2] = sub_ious
             del sub_masks2
         del sub_masks1
-    
+
     return ious
 
 
-def non_max_suppression(masks, scores, threshold=0.5):  
+def non_max_suppression(masks, scores, threshold=0.5):
     """
     Performs Non-Maximum Suppression (NMS) on a set of masks based on their IoU and scores.
 
@@ -340,24 +346,24 @@ def non_max_suppression(masks, scores, threshold=0.5):
     bboxes = mask_bbox(masks)
     # Calculate IoU between all pairs of bounding boxes
     bbox_ious = box_iou(bboxes, bboxes).cpu().numpy()
-    
+
     # Sort indices by scores in descending order
     sorted_indices = scores.argsort(descending=True).cpu().numpy()
     order = torch.argsort(scores, descending=True).cpu().numpy()
     keep_indices = []
-    
+
     while np.size(order) > 0:
         # Add the index with the highest score to the keep list
         keep_indices.append(order[0])
         # Calculate IoUs of the current mask with the remaining masks
         ious = bbox_ious[order[0], order[1:]]
         flags = ious > 0.01
-        
+
         if flags.sum() > 0:
             # If there are overlapping masks, calculate mask IoU for more accurate suppression
-            mask_ious = mask_iou(masks[order[0]][None,...], masks[order[1:][flags]])
+            mask_ious = mask_iou(masks[order[0]][None, ...], masks[order[1:][flags]])
             ious[flags] = mask_ious[0].cpu().numpy()
-        
+
         # Keep only those masks that have an IoU less than the threshold with the current mask
         order = order[1:][ious < threshold]
 
@@ -386,13 +392,13 @@ def non_max_suppression_multiclass(masks, bboxes, labels, scores, threshold=0.5)
     all_keep_indices = []
     for label in labels.unique():
         # Find indices of masks belonging to the current label
-        label_indices = [item[0].item() for item in (labels==label).nonzero()]
+        label_indices = [item[0].item() for item in (labels == label).nonzero()]
         # Apply NMS to get indices of masks to keep
         keep_indices = non_max_suppression(masks[label_indices], scores[label_indices], threshold)
         # Map the kept indices back to the original indices
         label_indices = [label_indices[item] for item in keep_indices]
         all_keep_indices += label_indices
-    
+
     return masks[all_keep_indices], bboxes[all_keep_indices], labels[all_keep_indices], scores[all_keep_indices]
 
 
@@ -404,133 +410,135 @@ def post_process_instance_segmentation(
         oriimg_size: Tuple[int, int],
         target_size: Tuple[int, int],
         threshold_prob: float = 0.01,
-        threshold_nms:  float = 0.25,
-    ) -> List[Dict]:
-        """
-        Processes predicted instance masks, bounding boxes, labels, and semantic masks.
-        
-        Parameters:
-        - pred_instance_masks: Tensor, predicted instance masks.
-        - pred_instance_bboxes: Tensor, predicted instance bounding boxes.
-        - pred_instance_labels: Tensor, predicted instance labels.
-        - pred_semantic_masks: Tensor, predicted semantic masks.
-        - oriimg_size: Tuple, original image size.
-        - target_size: Tuple, target image size after processing.
-        - threshold_prob: float, probability threshold for filtering instances.
-        - threshold_nms: float, IoU threshold for non-maximum suppression.
-        
-        Returns:
-        - outputs: List of processed tensors including instance masks, bboxes, labels, scores, semantic masks, labels, and scores.
-        """
+        threshold_nms: float = 0.25,
+) -> List[Dict]:
+    """
+    Processes predicted instance masks, bounding boxes, labels, and semantic masks.
 
-        # Filter instances based on their confidence scores
-        instance_scores, instance_labels = pred_instance_labels.softmax(dim=-1)[:, :-1].max(dim=-1)
-        indexes = instance_scores >= threshold_prob
-        if indexes.sum() == 0:
-            indexes[0] = True
-        pred_instance_masks  = pred_instance_masks[indexes]
-        pred_instance_bboxes = pred_instance_bboxes[indexes]
-        pred_instance_labels = pred_instance_labels[indexes]
+    Parameters:
+    - pred_instance_masks: Tensor, predicted instance masks.
+    - pred_instance_bboxes: Tensor, predicted instance bounding boxes.
+    - pred_instance_labels: Tensor, predicted instance labels.
+    - pred_semantic_masks: Tensor, predicted semantic masks.
+    - oriimg_size: Tuple, original image size.
+    - target_size: Tuple, target image size after processing.
+    - threshold_prob: float, probability threshold for filtering instances.
+    - threshold_nms: float, IoU threshold for non-maximum suppression.
 
-        # Further filter based on mask predictions
-        indexes = (pred_instance_masks.sigmoid() > 0.5).sum(dim=[1,2]) > 0
-        if indexes.sum() == 0:
-            indexes[0] = True
-        pred_instance_masks  = pred_instance_masks[indexes]
-        pred_instance_bboxes = pred_instance_bboxes[indexes]
-        pred_instance_labels = pred_instance_labels[indexes]
+    Returns:
+    - outputs: List of processed tensors including instance masks, bboxes, labels, scores, semantic masks, labels, and scores.
+    """
 
-        # Resize and process instance masks
-        mask_logits = F.interpolate(pred_instance_masks[None], size=target_size, mode="bilinear", align_corners=False)[0].sigmoid()
-        instance_maskes = mask_logits > 0.5
-        mask_scores = [(score * label).sum() / max(label.sum(), 1e-6) for score, label in zip(mask_logits, instance_maskes)]
-        mask_scores = torch.stack(mask_scores, dim=0)
+    # Filter instances based on their confidence scores
+    instance_scores, instance_labels = pred_instance_labels.softmax(dim=-1)[:, :-1].max(dim=-1)
+    indexes = instance_scores >= threshold_prob
+    if indexes.sum() == 0:
+        indexes[0] = True
+    pred_instance_masks = pred_instance_masks[indexes]
+    pred_instance_bboxes = pred_instance_bboxes[indexes]
+    pred_instance_labels = pred_instance_labels[indexes]
 
-        # Calculate final instance scores and labels
-        instance_scores, instance_labels = pred_instance_labels.softmax(dim=-1)[:, :-1].max(dim=-1)
-        instance_scores = instance_scores * mask_scores
-        instance_labels = instance_labels + 1   # 0 for "_background_"
+    # Further filter based on mask predictions
+    indexes = (pred_instance_masks.sigmoid() > 0.5).sum(dim=[1, 2]) > 0
+    if indexes.sum() == 0:
+        indexes[0] = True
+    pred_instance_masks = pred_instance_masks[indexes]
+    pred_instance_bboxes = pred_instance_bboxes[indexes]
+    pred_instance_labels = pred_instance_labels[indexes]
 
-        # Adjust bounding boxes to target size
-        pred_instance_bboxes[:, [0,2]] = pred_instance_bboxes[:, [0,2]] / oriimg_size[1] * target_size[1]
-        pred_instance_bboxes[:, [1,3]] = pred_instance_bboxes[:, [1,3]] / oriimg_size[0] * target_size[0]
-        pred_instance_bboxes[:, 2] = pred_instance_bboxes[:, 2] - pred_instance_bboxes[:, 0]
-        pred_instance_bboxes[:, 3] = pred_instance_bboxes[:, 3] - pred_instance_bboxes[:, 1]
-        instance_bboxes = pred_instance_bboxes
-        
-        # Resize and process semantic masks
-        mask_logits = F.interpolate(pred_semantic_masks[None], size=target_size, mode="bilinear", align_corners=False)[0].sigmoid()
-        semantic_maskes = mask_logits > 0.5
-        
-        # Apply Non-Maximum Suppression (NMS)
-        instance_maskes, instance_bboxes, instance_labels, instance_scores = non_max_suppression_multiclass(\
-            instance_maskes, instance_bboxes, instance_labels, instance_scores, threshold=threshold_nms)
-        
-        outputs = [instance_maskes, instance_bboxes, instance_labels, instance_scores, semantic_maskes]
-        
-        return outputs
+    # Resize and process instance masks
+    mask_logits = F.interpolate(pred_instance_masks[None], size=target_size, mode="bilinear", align_corners=False)[
+        0].sigmoid()
+    instance_maskes = mask_logits > 0.5
+    mask_scores = [(score * label).sum() / max(label.sum(), 1e-6) for score, label in zip(mask_logits, instance_maskes)]
+    mask_scores = torch.stack(mask_scores, dim=0)
+
+    # Calculate final instance scores and labels
+    instance_scores, instance_labels = pred_instance_labels.softmax(dim=-1)[:, :-1].max(dim=-1)
+    instance_scores = instance_scores * mask_scores
+    instance_labels = instance_labels + 1  # 0 for "_background_"
+
+    # Adjust bounding boxes to target size
+    pred_instance_bboxes[:, [0, 2]] = pred_instance_bboxes[:, [0, 2]] / oriimg_size[1] * target_size[1]
+    pred_instance_bboxes[:, [1, 3]] = pred_instance_bboxes[:, [1, 3]] / oriimg_size[0] * target_size[0]
+    pred_instance_bboxes[:, 2] = pred_instance_bboxes[:, 2] - pred_instance_bboxes[:, 0]
+    pred_instance_bboxes[:, 3] = pred_instance_bboxes[:, 3] - pred_instance_bboxes[:, 1]
+    instance_bboxes = pred_instance_bboxes
+
+    # Resize and process semantic masks
+    mask_logits = F.interpolate(pred_semantic_masks[None], size=target_size, mode="bilinear", align_corners=False)[
+        0].sigmoid()
+    semantic_maskes = mask_logits > 0.5
+
+    # Apply Non-Maximum Suppression (NMS)
+    instance_maskes, instance_bboxes, instance_labels, instance_scores = non_max_suppression_multiclass( \
+        instance_maskes, instance_bboxes, instance_labels, instance_scores, threshold=threshold_nms)
+
+    outputs = [instance_maskes, instance_bboxes, instance_labels, instance_scores, semantic_maskes]
+
+    return outputs
 
 
 def get_instance_segmentation_results(
         seg_results: List[torch.Tensor],
         image_bbox: Tuple[int, int] = None,
         class_names: List[str] = None,
-    ) -> List[Dict]:
-        """
-        Extracts and sorts instance segmentation results.
+) -> List[Dict]:
+    """
+    Extracts and sorts instance segmentation results.
 
-        Parameters:
-        - seg_results: List of Tensors, processed segmentation results.
-        - image_bbox: Tuple, bounding box coordinates of the image region.
-        - class_names: List of strings, names of classes.
+    Parameters:
+    - seg_results: List of Tensors, processed segmentation results.
+    - image_bbox: Tuple, bounding box coordinates of the image region.
+    - class_names: List of strings, names of classes.
 
-        Returns:
-        - results: Dictionary containing instance masks, bounding boxes, scores, labels, semantic masks, scores, and labels.
-        """
+    Returns:
+    - results: Dictionary containing instance masks, bounding boxes, scores, labels, semantic masks, scores, and labels.
+    """
 
-        instance_maskes, instance_bboxes, instance_labels, instance_scores, semantic_maskes = seg_results
-        x1, y1, x2, y2 = image_bbox
-        instance_maskes = instance_maskes[:,y1:y2,x1:x2]
-        semantic_maskes = semantic_maskes[:,y1:y2,x1:x2]
-        instance_bboxes[:, 0] -= x1
-        instance_bboxes[:, 1] -= y1
-        
-        # Sort instances by area from largest to smallest
-        instances = []
-        for j in range(instance_maskes.size(0)):
-            instance = {
-                "instance_mask":  instance_maskes[j],
-                "instance_bbox":  instance_bboxes[j],
-                "instance_score": instance_scores[j],
-                "instance_label": instance_labels[j],
-            }
-            instances.append(instance)
+    instance_maskes, instance_bboxes, instance_labels, instance_scores, semantic_maskes = seg_results
+    x1, y1, x2, y2 = image_bbox
+    instance_maskes = instance_maskes[:, y1:y2, x1:x2]
+    semantic_maskes = semantic_maskes[:, y1:y2, x1:x2]
+    instance_bboxes[:, 0] -= x1
+    instance_bboxes[:, 1] -= y1
 
-        instances  = sorted(instances, key=lambda instances: instances["instance_mask"].sum(), reverse=True)
-        
-        # Prepare final lists of tensors
-        instance_maskes = [item["instance_mask"]  for item in instances]
-        instance_bboxes = [item["instance_bbox"]  for item in instances]
-        instance_scores = [item["instance_score"] for item in instances]
-        instance_labels = [item["instance_label"] for item in instances]
-        
-        instance_maskes = torch.stack(instance_maskes, dim=0)
-        instance_bboxes = torch.stack(instance_bboxes, dim=0)
-        instance_scores = torch.stack(instance_scores, dim=0)
-        instance_labels = torch.stack(instance_labels, dim=0) 
-                
-        # Process semantic masks
-        semantic_maskes = semantic_maskes[:len(class_names)-1,...]
+    # Sort instances by area from largest to smallest
+    instances = []
+    for j in range(instance_maskes.size(0)):
+        instance = {
+            "instance_mask": instance_maskes[j],
+            "instance_bbox": instance_bboxes[j],
+            "instance_score": instance_scores[j],
+            "instance_label": instance_labels[j],
+        }
+        instances.append(instance)
 
-        results = { "instance_maskes": instance_maskes, 
-                    "instance_bboxes": instance_bboxes, 
-                    "instance_scores": instance_scores,
-                    "instance_labels": instance_labels, 
-                    "semantic_maskes": semantic_maskes, 
-                }
-        
-        return results
-    
+    instances = sorted(instances, key=lambda instances: instances["instance_mask"].sum(), reverse=True)
+
+    # Prepare final lists of tensors
+    instance_maskes = [item["instance_mask"] for item in instances]
+    instance_bboxes = [item["instance_bbox"] for item in instances]
+    instance_scores = [item["instance_score"] for item in instances]
+    instance_labels = [item["instance_label"] for item in instances]
+
+    instance_maskes = torch.stack(instance_maskes, dim=0)
+    instance_bboxes = torch.stack(instance_bboxes, dim=0)
+    instance_scores = torch.stack(instance_scores, dim=0)
+    instance_labels = torch.stack(instance_labels, dim=0)
+
+    # Process semantic masks
+    semantic_maskes = semantic_maskes[:len(class_names) - 1, ...]
+
+    results = {"instance_maskes": instance_maskes,
+               "instance_bboxes": instance_bboxes,
+               "instance_scores": instance_scores,
+               "instance_labels": instance_labels,
+               "semantic_maskes": semantic_maskes,
+               }
+
+    return results
+
 
 def predict_whole(model, batch, layer_idx=-1):
     """
@@ -553,16 +561,16 @@ def predict_whole(model, batch, layer_idx=-1):
     pixel_values, pixel_mask, class_names = batch["pixel_values"], batch["pixel_mask"], batch["class_names"]
 
     # Perform forward pass through the model to get predictions
-    if isinstance(model, nn.parallel.DistributedDataParallel):  
+    if isinstance(model, nn.parallel.DistributedDataParallel):
         # If the model is wrapped with DistributedDataParallel, access the underlying module
-        pred = model.module.mask2former(pixel_values=pixel_values, pixel_mask=pixel_mask, class_names=class_names,)
+        pred = model.module.mask2former(pixel_values=pixel_values, pixel_mask=pixel_mask, class_names=class_names, )
     else:
         # Otherwise, directly call the mask2former method of the model
-        pred = model.mask2former(pixel_values=pixel_values, pixel_mask=pixel_mask, class_names=class_names,)
+        pred = model.mask2former(pixel_values=pixel_values, pixel_mask=pixel_mask, class_names=class_names, )
 
     # Initialize a list to store prediction results for each image in the batch
     batch_results = []
-    
+
     # Process each image in the batch individually
     for i in range(pixel_values.size(0)):
         # Post-process instance segmentation results for the current image
@@ -574,13 +582,14 @@ def predict_whole(model, batch, layer_idx=-1):
             oriimg_size=pixel_values.shape[-2:],  # Original image size (height, width)
             target_size=pixel_values.shape[-2:],  # Target size for resizing masks and bboxes
         )
-        
+
         # Further process and extract detailed segmentation results
-        seg_results = get_instance_segmentation_results(seg_results, image_bbox=batch["image_bboxes"][i], class_names=batch["class_names"][i])
+        seg_results = get_instance_segmentation_results(seg_results, image_bbox=batch["image_bboxes"][i],
+                                                        class_names=batch["class_names"][i])
         batch_results.append(seg_results)
 
     return batch_results
-    
+
 
 def true_positive_num(true_masks, pred_masks, iou_thres=[0.5]):
     """
@@ -614,7 +623,7 @@ def true_positive_num(true_masks, pred_masks, iou_thres=[0.5]):
 
     # Sort the matched pairs by IoU in descending order
     items = sorted(items, key=lambda item: item["iou"], reverse=True)
-    
+
     # Calculate the number of true positives for each IoU threshold
     for i in range(len(iou_thres)):
         true_positives = [item for item in items if item["iou"] >= iou_thres[i]]
@@ -623,7 +632,8 @@ def true_positive_num(true_masks, pred_masks, iou_thres=[0.5]):
     return true_num, pred_num, tp_nums
 
 
-def true_positive_num_multiclass(true_masks, true_labels, pred_masks, pred_labels, pred_scores, labels, iou_thres=[0.5]):
+def true_positive_num_multiclass(true_masks, true_labels, pred_masks, pred_labels, pred_scores, labels,
+                                 iou_thres=[0.5]):
     """
     Extends true_positive_num function to handle multiple classes.
 
@@ -641,7 +651,7 @@ def true_positive_num_multiclass(true_masks, true_labels, pred_masks, pred_label
     """
 
     # Initialize lists to store results for each class
-    true_nums  = []
+    true_nums = []
     pred_nums = []
     tp_nums = []
 
@@ -651,12 +661,12 @@ def true_positive_num_multiclass(true_masks, true_labels, pred_masks, pred_label
     # Iterate over each class label
     for label in labels:
         # Filter masks and scores for the current class
-        true_masks_label  = true_masks[true_labels == label]
-        pred_masks_label  = pred_masks[pred_labels == label]
+        true_masks_label = true_masks[true_labels == label]
+        pred_masks_label = pred_masks[pred_labels == label]
         pred_scores_label = pred_scores[pred_labels == label]
 
         # Filter predicted masks based on confidence score threshold (e.g., >= 0.5)
-        pred_masks_label  = pred_masks_label[pred_scores_label >= 0.5]
+        pred_masks_label = pred_masks_label[pred_scores_label >= 0.5]
 
         # Calculate true positives for the current class using the base function
         true_num, pred_num, tp_num = true_positive_num(true_masks_label, pred_masks_label, iou_thres)
@@ -665,7 +675,7 @@ def true_positive_num_multiclass(true_masks, true_labels, pred_masks, pred_label
         true_nums.append(true_num)
         pred_nums.append(pred_num)
         tp_nums.append(tp_num)
-    
+
     return true_nums, pred_nums, tp_nums
 
 
@@ -696,24 +706,27 @@ def sliding_window_crop(image, mask, patch_size):
 
     # Initialize lists to store cropped patches, masks, and their corresponding bounding boxes
     pixel_values = []
-    pixel_mask   = []
+    pixel_mask = []
     patch_bboxes = []
     image_bboxes = []
-    
+
     # Preprocess the initial data: resize the entire image and mask to the target patch size using interpolation
     # This ensures that the full image is included as a single patch at the beginning
-    pixel_values.append(F.interpolate(image[None], size=patch_size, mode="area")[0])  # Resize image using area interpolation
-    pixel_mask.append(F.interpolate(mask[None], size=patch_size, mode="nearest")[0])  # Resize mask using nearest-neighbor interpolation
+    pixel_values.append(
+        F.interpolate(image[None], size=patch_size, mode="area")[0])  # Resize image using area interpolation
+    pixel_mask.append(F.interpolate(mask[None], size=patch_size, mode="nearest")[
+                          0])  # Resize mask using nearest-neighbor interpolation
     patch_bboxes.append([0, 0, W, H])  # Bounding box for the full image in the original coordinate system
-    image_bboxes.append([0, 0, patch_size[1], patch_size[0]])  # Bounding box for the full image in the local coordinate system
-    
+    image_bboxes.append(
+        [0, 0, patch_size[1], patch_size[0]])  # Bounding box for the full image in the local coordinate system
+
     # Calculate the stride for vertical and horizontal directions (half the patch size)
     stride_v, stride_h = patch_size[0] // 2, patch_size[1] // 2
 
     # Compute the number of patches required in the vertical and horizontal directions
     patch_rows = int(math.ceil((H - patch_size[0]) / stride_v) + 1)  # Number of rows of patches
     patch_cols = int(math.ceil((W - patch_size[1]) / stride_h) + 1)  # Number of columns of patches
-    
+
     # Iterate over all possible patches using the sliding window approach
     for row in range(patch_rows):
         for col in range(patch_cols):
@@ -724,23 +737,24 @@ def sliding_window_crop(image, mask, patch_size):
             x1 = int(col * stride_h)  # Left edge of the patch
             x2 = min(x1 + patch_size[1], W)  # Right edge of the patch (clamped to image width)
             x1 = max(x2 - patch_size[1], 0)  # Adjust left edge if necessary to ensure patch size is maintained
-            
+
             # Append the cropped patch, mask, and bounding boxes for the current patch
             pixel_values.append(image[:, y1:y2, x1:x2])
             pixel_mask.append(mask[:, y1:y2, x1:x2])
             patch_bboxes.append([x1, y1, x2, y2])
             image_bboxes.append([0, 0, x2 - x1, y2 - y1])
-            
+
     # Stack all cropped patches, masks, and bounding boxes into tensors
     pixel_values = torch.stack(pixel_values, dim=0)
-    pixel_mask   = torch.stack(pixel_mask, dim=0)
+    pixel_mask = torch.stack(pixel_mask, dim=0)
     patch_bboxes = torch.tensor(patch_bboxes).long()
     image_bboxes = torch.tensor(image_bboxes).long()
-    
-    return pixel_values, pixel_mask, patch_bboxes, image_bboxes
-    
 
-def predict_with_dynamic_batch_size(model, pixel_values, pixel_mask, image_bboxes, class_names, batch_size=64, layer_idx=-1):
+    return pixel_values, pixel_mask, patch_bboxes, image_bboxes
+
+
+def predict_with_dynamic_batch_size(model, pixel_values, pixel_mask, image_bboxes, class_names, batch_size=64,
+                                    layer_idx=-1):
     """
     Perform predictions using a dynamic batch size to handle memory constraints.
 
@@ -804,10 +818,14 @@ def predict_with_dynamic_batch_size(model, pixel_values, pixel_mask, image_bboxe
                     )
 
                 # Extract predictions from the specified decoder layer and split them by batch dimension
-                instance_masks += [item[0] for item in batch_preds.transformer_decoder_instance_masks[layer_idx].split(1, dim=0)]
-                bbox_predictions += [item[0] for item in batch_preds.transformer_decoder_bbox_predictions[layer_idx].split(1, dim=0)]
-                cate_predictions += [item[0] for item in batch_preds.transformer_decoder_cate_predictions[layer_idx].split(1, dim=0)]
-                semantic_masks += [item[0] for item in batch_preds.transformer_decoder_semantic_masks[layer_idx].split(1, dim=0)]
+                instance_masks += [item[0] for item in
+                                   batch_preds.transformer_decoder_instance_masks[layer_idx].split(1, dim=0)]
+                bbox_predictions += [item[0] for item in
+                                     batch_preds.transformer_decoder_bbox_predictions[layer_idx].split(1, dim=0)]
+                cate_predictions += [item[0] for item in
+                                     batch_preds.transformer_decoder_cate_predictions[layer_idx].split(1, dim=0)]
+                semantic_masks += [item[0] for item in
+                                   batch_preds.transformer_decoder_semantic_masks[layer_idx].split(1, dim=0)]
 
             # Pad predictions to ensure they have the same size across all patches
             instance_masks = pad_sequence(instance_masks, batch_first=True, padding_value=-1e10)
@@ -847,12 +865,12 @@ def predict_slide_window(model, batch, patch_size, layer_idx=-1):
 
     # Initialize lists to store data for all patches across the batch
     all_pixel_values = []
-    all_pixel_mask   = []
+    all_pixel_mask = []
     all_patch_bboxes = []
     all_image_bboxes = []
-    all_class_names  = []
+    all_class_names = []
     image_patch_nums = []
-    
+
     # Perform sliding window cropping for each image in the batch
     for image, mask, class_names in zip(batch["pixel_values"], batch["pixel_mask"], batch["class_names"]):
         pixel_values, pixel_mask, patch_bboxes, image_bboxes = sliding_window_crop(image, mask, patch_size)
@@ -862,37 +880,38 @@ def predict_slide_window(model, batch, patch_size, layer_idx=-1):
         all_image_bboxes.append(image_bboxes)
         all_class_names += [class_names] * pixel_values.shape[0]  # Repeat class names for each patch
         image_patch_nums.append(pixel_values.shape[0])  # Store the number of patches for this image
-        
+
     # Concatenate all patches into single tensors for batch processing
     all_pixel_values = torch.cat(all_pixel_values, dim=0)
-    all_pixel_mask   = torch.cat(all_pixel_mask, dim=0)
+    all_pixel_mask = torch.cat(all_pixel_mask, dim=0)
     all_image_bboxes = torch.cat(all_image_bboxes, dim=0)
-    
+
     # Perform predictions using dynamic batch size to handle memory constraints
     all_instance_masks, all_bbox_predictions, all_cate_predictions, all_semantic_masks = \
-        predict_with_dynamic_batch_size(model, all_pixel_values, all_pixel_mask, all_image_bboxes, all_class_names, batch_size=16, layer_idx=layer_idx)
-    
+        predict_with_dynamic_batch_size(model, all_pixel_values, all_pixel_mask, all_image_bboxes, all_class_names,
+                                        batch_size=16, layer_idx=layer_idx)
+
     # Split predictions back into per-image results based on the number of patches per image
-    all_instance_masks   = all_instance_masks.split(image_patch_nums, dim=0)
+    all_instance_masks = all_instance_masks.split(image_patch_nums, dim=0)
     all_bbox_predictions = all_bbox_predictions.split(image_patch_nums, dim=0)
     all_cate_predictions = all_cate_predictions.split(image_patch_nums, dim=0)
-    all_semantic_masks   = all_semantic_masks.split(image_patch_nums, dim=0)
-    
+    all_semantic_masks = all_semantic_masks.split(image_patch_nums, dim=0)
+
     # Post-processing step to merge overlapping predictions and perform non-max suppression
     batch_results = []
     for n in range(len(batch["pixel_values"])):  # Iterate over each image in the batch
         C, H, W = batch["pixel_values"][n].shape  # Original image dimensions
-        
+
         # Extract predictions for the current image
         instance_masks = all_instance_masks[n]
         bbox_predictions = all_bbox_predictions[n]
         cate_predictions = all_cate_predictions[n]
         semantic_masks = all_semantic_masks[n]
         patch_bboxes = all_patch_bboxes[n]
-        
+
         # Create a count map to track overlapping regions during merging
         count_map = torch.ones(1, H, W).to(semantic_masks.device)
-        
+
         # Merge predictions for each image and apply post-processing steps
         for p in range(instance_masks.shape[0]):  # Iterate over each patch
             target_size = (H, W) if p == 0 else patch_size  # Use full image size for the first patch
@@ -904,7 +923,7 @@ def predict_slide_window(model, batch, patch_size, layer_idx=-1):
                 oriimg_size=patch_size,
                 target_size=target_size,
             )
-            
+
             # Combine results for whole images and patches
             if p == 0:
                 # Apply weighting to the first patch (full image) predictions
@@ -914,15 +933,16 @@ def predict_slide_window(model, batch, patch_size, layer_idx=-1):
             else:
                 # Update and merge instance segmentation results for overlapping patches
                 instance_maskes, instance_bboxes, instance_labels, instance_scores, semantic_maskes = seg_results
-                
+
                 # Detect boundary instances and reduce their confidence scores
                 bboxes = mask_bbox(instance_maskes)
-                indexes = (bboxes[:, 0] < 4) | (bboxes[:, 1] < 4) | (bboxes[:, 2] > patch_size[1]-4) | (bboxes[:, 3] > patch_size[0]-4)
+                indexes = (bboxes[:, 0] < 4) | (bboxes[:, 1] < 4) | (bboxes[:, 2] > patch_size[1] - 4) | (
+                            bboxes[:, 3] > patch_size[0] - 4)
                 instance_scores[indexes] = instance_scores[indexes] * 0.5
-                
+
                 # Map patch coordinates back to the original image coordinate system
                 x1, y1, x2, y2 = patch_bboxes[p]
-                instance_maskes = F.pad(instance_maskes, (x1, W-x2, y1, H-y2), "constant", 0)
+                instance_maskes = F.pad(instance_maskes, (x1, W - x2, y1, H - y2), "constant", 0)
                 instance_bboxes[:, 0] += x1
                 instance_bboxes[:, 1] += y1
 
@@ -933,9 +953,10 @@ def predict_slide_window(model, batch, patch_size, layer_idx=-1):
                 batch_results[n][3] = torch.cat((batch_results[n][3], instance_scores), dim=0)
                 batch_results[n][4][:, y1:y2, x1:x2] += semantic_maskes.float()
                 count_map[:, y1:y2, x1:x2] += 1
-                
+
                 # Apply Non-Maximum Suppression (NMS) to remove redundant predictions
-                batch_results[n][0], batch_results[n][1], batch_results[n][2], batch_results[n][3] = non_max_suppression_multiclass(
+                batch_results[n][0], batch_results[n][1], batch_results[n][2], batch_results[n][
+                    3] = non_max_suppression_multiclass(
                     batch_results[n][0], batch_results[n][1], batch_results[n][2], batch_results[n][3], threshold=0.5)
 
         # Finalize predictions by averaging overlapping regions and thresholding semantic masks
@@ -943,10 +964,10 @@ def predict_slide_window(model, batch, patch_size, layer_idx=-1):
         batch_results[n] = get_instance_segmentation_results(
             batch_results[n], image_bbox=batch["image_bboxes"][n], class_names=batch["class_names"][n]
         )
-        
+
     return batch_results
 
-    
+
 def evaluate(args, model, dataloader, gpu_id=0, save_num=50, stage="test"):
     """
     Evaluates the performance of a model on a given dataset using metrics such as IoU, precision, recall, etc.
@@ -1010,8 +1031,11 @@ def evaluate(args, model, dataloader, gpu_id=0, save_num=50, stage="test"):
             torch.cuda.empty_cache()  # Clear GPU memory cache
 
             # Move batch data to the specified GPU
-            batch['pixel_values'] = [item.cuda(device) for item in batch['pixel_values']] if isinstance(batch['pixel_values'], list) else batch['pixel_values'].cuda(device)
-            batch['pixel_mask'] = [item.cuda(device) for item in batch['pixel_mask']] if isinstance(batch['pixel_mask'], list) else batch['pixel_mask'].cuda(device)
+            batch['pixel_values'] = [item.cuda(device) for item in batch['pixel_values']] if isinstance(
+                batch['pixel_values'], list) else batch['pixel_values'].cuda(device)
+            batch['pixel_mask'] = [item.cuda(device) for item in batch['pixel_mask']] if isinstance(batch['pixel_mask'],
+                                                                                                    list) else batch[
+                'pixel_mask'].cuda(device)
             batch['instance_masks'] = [item.cuda(device) for item in batch['instance_masks']]
             batch['instance_bboxes'] = [item.cuda(device) for item in batch['instance_bboxes']]
             batch['instance_labels'] = [item.cuda(device) for item in batch['instance_labels']]
@@ -1056,42 +1080,52 @@ def evaluate(args, model, dataloader, gpu_id=0, save_num=50, stage="test"):
                     image_semantic_gt = copy.deepcopy(image)
                     semantic_gt = bimask_to_id_mask(semantic_masks.cpu().numpy())
                     color_mask = id_map_to_color(semantic_gt, semantic_palette)
-                    image_semantic_gt[semantic_gt > 0] = image_semantic_gt[semantic_gt > 0] // 2 + color_mask[semantic_gt > 0] // 2
+                    image_semantic_gt[semantic_gt > 0] = image_semantic_gt[semantic_gt > 0] // 2 + color_mask[
+                        semantic_gt > 0] // 2
                     image_semantic_gt = PILImage.fromarray(image_semantic_gt)
                     MakePath(os.path.join(args.save_path, dataset_names, image_names + "_semantic_gt.png"))
-                    image_semantic_gt.save(os.path.join(args.save_path, dataset_names, image_names + "_semantic_gt.png"))
+                    image_semantic_gt.save(
+                        os.path.join(args.save_path, dataset_names, image_names + "_semantic_gt.png"))
 
                     # Visualize and save predicted semantic masks
                     image_semantic_dt = copy.deepcopy(image)
                     semantic_dt = bimask_to_id_mask(results['semantic_maskes'].cpu().numpy())
                     color_mask = id_map_to_color(semantic_dt, semantic_palette)
-                    image_semantic_dt[semantic_dt > 0] = image_semantic_dt[semantic_dt > 0] // 2 + color_mask[semantic_dt > 0] // 2
+                    image_semantic_dt[semantic_dt > 0] = image_semantic_dt[semantic_dt > 0] // 2 + color_mask[
+                        semantic_dt > 0] // 2
                     image_semantic_dt = PILImage.fromarray(image_semantic_dt)
                     MakePath(os.path.join(args.save_path, dataset_names, image_names + "_semantic_dt.png"))
-                    image_semantic_dt.save(os.path.join(args.save_path, dataset_names, image_names + "_semantic_dt.png"))
+                    image_semantic_dt.save(
+                        os.path.join(args.save_path, dataset_names, image_names + "_semantic_dt.png"))
 
                     # Visualize and save instance ground truth masks
                     image_instance_gt = copy.deepcopy(image)
                     instance_gt = bimask_to_id_mask(instance_masks.cpu().numpy())
                     color_mask = id_map_to_color(instance_gt, instance_palette)
-                    image_instance_gt[instance_gt > 0] = image_instance_gt[instance_gt > 0] // 2 + color_mask[instance_gt > 0] // 2
+                    image_instance_gt[instance_gt > 0] = image_instance_gt[instance_gt > 0] // 2 + color_mask[
+                        instance_gt > 0] // 2
 
                     image_instance_dt = copy.deepcopy(image)
-                    instance_dt = bimask_to_id_mask(results['instance_maskes'][results['instance_scores'] > 0.5].cpu().numpy())
+                    instance_dt = bimask_to_id_mask(
+                        results['instance_maskes'][results['instance_scores'] > 0.5].cpu().numpy())
                     color_mask = id_map_to_color(instance_dt, instance_palette)
-                    image_instance_dt[instance_dt > 0] = image_instance_dt[instance_dt > 0] // 2 + color_mask[instance_dt > 0] // 2
+                    image_instance_dt[instance_dt > 0] = image_instance_dt[instance_dt > 0] // 2 + color_mask[
+                        instance_dt > 0] // 2
 
                     # Draw bounding boxes and labels on the instance ground truth image
                     for bbox, label in zip(instance_bboxes, batch['instance_labels'][i]):
                         x1, y1, x2, y2 = bbox
                         category_id = label + 1
-                        cv2.rectangle(image_instance_gt, (int(x1), int(y1)), (int(x2), int(y2)), color=semantic_palette[category_id * 3:category_id * 3 + 3], thickness=2)
+                        cv2.rectangle(image_instance_gt, (int(x1), int(y1)), (int(x2), int(y2)),
+                                      color=semantic_palette[category_id * 3:category_id * 3 + 3], thickness=2)
                         class_score = class_names[category_id - 1]
-                        cv2.putText(image_instance_gt, class_score, (int(x1), int(y1)), cv2.FONT_HERSHEY_SIMPLEX, 0.3, semantic_palette[category_id * 3:category_id * 3 + 3], 1)
+                        cv2.putText(image_instance_gt, class_score, (int(x1), int(y1)), cv2.FONT_HERSHEY_SIMPLEX, 0.3,
+                                    semantic_palette[category_id * 3:category_id * 3 + 3], 1)
 
                     image_instance_gt = PILImage.fromarray(image_instance_gt)
                     MakePath(os.path.join(args.save_path, dataset_names, image_names + "_instance_gt.png"))
-                    image_instance_gt.save(os.path.join(args.save_path, dataset_names, image_names + "_instance_gt.png"))
+                    image_instance_gt.save(
+                        os.path.join(args.save_path, dataset_names, image_names + "_instance_gt.png"))
 
                     # Visualize and save predicted category masks
                     image_category_dt = copy.deepcopy(image)
@@ -1102,10 +1136,12 @@ def evaluate(args, model, dataloader, gpu_id=0, save_num=50, stage="test"):
                             category_dt[results['instance_maskes'][j] == 1] = results['instance_labels'][j]
 
                     color_mask = id_map_to_color(category_dt, semantic_palette)
-                    image_category_dt[category_dt > 0] = image_category_dt[category_dt > 0] // 2 + color_mask[category_dt > 0] // 2
+                    image_category_dt[category_dt > 0] = image_category_dt[category_dt > 0] // 2 + color_mask[
+                        category_dt > 0] // 2
                     image_category_dt = PILImage.fromarray(image_category_dt)
                     MakePath(os.path.join(args.save_path, dataset_names, image_names + "_category_dt.png"))
-                    image_category_dt.save(os.path.join(args.save_path, dataset_names, image_names + "_category_dt.png"))
+                    image_category_dt.save(
+                        os.path.join(args.save_path, dataset_names, image_names + "_category_dt.png"))
 
                 # Update semantic segmentation metrics
                 for c in range(semantic_masks.size(0)):
@@ -1116,7 +1152,8 @@ def evaluate(args, model, dataloader, gpu_id=0, save_num=50, stage="test"):
                 # Update instance segmentation metrics
                 true_nums, pred_nums, tp_nums = true_positive_num_multiclass(
                     instance_masks, batch['instance_labels'][i] + 1,
-                    results['instance_maskes'], results['instance_labels'], results['instance_scores'], labels=labels, iou_thres=iou_thres
+                    results['instance_maskes'], results['instance_labels'], results['instance_scores'], labels=labels,
+                    iou_thres=iou_thres
                 )
                 all_true_nums = [item1 + item2 for item1, item2 in zip(all_true_nums, true_nums)]
                 all_pred_nums = [item1 + item2 for item1, item2 in zip(all_pred_nums, pred_nums)]
@@ -1143,18 +1180,21 @@ def evaluate(args, model, dataloader, gpu_id=0, save_num=50, stage="test"):
                         "segmentation": segmentation,
                         "score": score,
                     })
-                    
+
                     if img_num < save_num and score >= 0.5:
-                        x1, y1, x2, y2 = bbox[0], bbox[1], bbox[0]+bbox[2], bbox[1]+bbox[3]
-                        cv2.rectangle(image_instance_dt, (int(x1), int(y1)), (int(x2), int(y2)), color=semantic_palette[category_id*3:category_id*3+3], thickness=2)
-                        class_score = class_names[category_id-1] + "-" + str(round(score, 4))
-                        cv2.putText(image_instance_dt, class_score, (int(x1), int(y2)), cv2.FONT_HERSHEY_SIMPLEX, 0.3, semantic_palette[category_id*3:category_id*3+3], 1)
+                        x1, y1, x2, y2 = bbox[0], bbox[1], bbox[0] + bbox[2], bbox[1] + bbox[3]
+                        cv2.rectangle(image_instance_dt, (int(x1), int(y1)), (int(x2), int(y2)),
+                                      color=semantic_palette[category_id * 3:category_id * 3 + 3], thickness=2)
+                        class_score = class_names[category_id - 1] + "-" + str(round(score, 4))
+                        cv2.putText(image_instance_dt, class_score, (int(x1), int(y2)), cv2.FONT_HERSHEY_SIMPLEX, 0.3,
+                                    semantic_palette[category_id * 3:category_id * 3 + 3], 1)
 
                 if img_num < save_num:
                     image_instance_dt = PILImage.fromarray(image_instance_dt)
                     MakePath(os.path.join(args.save_path, dataset_names, image_names + "_instance_dt.png"))
-                    image_instance_dt.save(os.path.join(args.save_path, dataset_names, image_names + "_instance_dt.png"))
-                
+                    image_instance_dt.save(
+                        os.path.join(args.save_path, dataset_names, image_names + "_instance_dt.png"))
+
                 img_num += 1  # Increment the image counter
 
     # Restore the model to training mode and clear GPU memory cache
@@ -1162,8 +1202,9 @@ def evaluate(args, model, dataloader, gpu_id=0, save_num=50, stage="test"):
     torch.cuda.empty_cache()
 
     # Return evaluation results
-    return (coco_gt, coco_dt, semantic_true_nums, semantic_pred_nums, semantic_correct_nums, all_true_nums, all_pred_nums, all_tp_nums)
-    
+    return (coco_gt, coco_dt, semantic_true_nums, semantic_pred_nums, semantic_correct_nums, all_true_nums,
+            all_pred_nums, all_tp_nums)
+
 
 def evaluate_parallel(args, model, dataset, save_num=50, stage="test", thres_num=1):
     """
@@ -1207,18 +1248,21 @@ def evaluate_parallel(args, model, dataset, save_num=50, stage="test", thres_num
             gpu_id = i % len(args.gpus.split(","))  # Assign a GPU to each process
             model_i = copy.deepcopy(model)  # Deep copy the model for each process
             subset = CustomSubset(dataset, range(indices[i], indices[i + 1]))  # Create a subset of the dataset
-            loader = DataLoaderX(subset, batch_size=1, shuffle=False, num_workers=0, pin_memory=True, collate_fn=subset.collate_fn)
+            loader = DataLoaderX(subset, batch_size=1, shuffle=False, num_workers=0, pin_memory=True,
+                                 collate_fn=subset.collate_fn)
             # Submit the evaluation task for the subset to the multiprocessing pool
-            results.append(mp_pool.apply_async(evaluate, args=(args, model_i, loader, gpu_id, eachThresSaveNum[i], stage)))
+            results.append(
+                mp_pool.apply_async(evaluate, args=(args, model_i, loader, gpu_id, eachThresSaveNum[i], stage)))
 
         # Collect results from all processes
         results = [p.get() for p in results]
 
         mp_pool.close()  # Close the multiprocessing pool
-        mp_pool.join()   # Wait for all processes to complete
+        mp_pool.join()  # Wait for all processes to complete
 
     # Aggregate results from all processes
-    coco_gt, coco_dt, semantic_true_nums, semantic_pred_nums, semantic_correct_nums, all_true_nums, all_pred_nums, all_tp_nums = results[0]
+    coco_gt, coco_dt, semantic_true_nums, semantic_pred_nums, semantic_correct_nums, all_true_nums, all_pred_nums, all_tp_nums = \
+    results[0]
     for idx in range(1, thres_num):
         # Combine COCO ground truth and detection structures
         coco_gt["images"] += results[idx][0]["images"]
@@ -1233,10 +1277,12 @@ def evaluate_parallel(args, model, dataset, save_num=50, stage="test", thres_num
         # Aggregate instance segmentation metrics
         all_true_nums = [item1 + item2 for item1, item2 in zip(all_true_nums, results[idx][5])]
         all_pred_nums = [item1 + item2 for item1, item2 in zip(all_pred_nums, results[idx][6])]
-        all_tp_nums = [[a + b for a, b in zip(sublist1, sublist2)] for sublist1, sublist2 in zip(all_tp_nums, results[idx][7])]
+        all_tp_nums = [[a + b for a, b in zip(sublist1, sublist2)] for sublist1, sublist2 in
+                       zip(all_tp_nums, results[idx][7])]
 
     # Return the aggregated evaluation results
-    return (coco_gt, coco_dt, semantic_true_nums, semantic_pred_nums, semantic_correct_nums,all_true_nums, all_pred_nums, all_tp_nums)
+    return (coco_gt, coco_dt, semantic_true_nums, semantic_pred_nums, semantic_correct_nums, all_true_nums,
+            all_pred_nums, all_tp_nums)
 
 
 def compute_metrics(results):
@@ -1263,13 +1309,13 @@ def compute_metrics(results):
 
     # Unpack the results tuple
     coco_gt, coco_dt, semantic_true_nums, semantic_pred_nums, semantic_correct_nums, \
-    all_true_nums, all_pred_nums, all_tp_nums = results
+        all_true_nums, all_pred_nums, all_tp_nums = results
 
     # Initialize metrics to be computed
     bbox_mAP = 0  # Object detection mAP (bounding box)
     mask_mAP = 0  # Instance segmentation mAP (mask)
     mask_mF1 = 0  # Instance segmentation mean F1-score
-    mIoU = 0      # Semantic segmentation mIoU
+    mIoU = 0  # Semantic segmentation mIoU
 
     # Save ground truth and detection results as JSON files for COCO evaluation
     MakePath("./temp/coco_gt.json")  # Ensure the directory exists
@@ -1343,7 +1389,8 @@ def compute_metrics(results):
     # Compute semantic segmentation mIoU
     try:
         # Calculate IoU for each class and average them
-        IoUs = [c / max(a + b - c, 1) for a, b, c in zip(semantic_true_nums, semantic_pred_nums, semantic_correct_nums) if a + b > 0]
+        IoUs = [c / max(a + b - c, 1) for a, b, c in zip(semantic_true_nums, semantic_pred_nums, semantic_correct_nums)
+                if a + b > 0]
         mIoU = sum(IoUs) / len(IoUs)
 
         # Print detailed metrics for debugging
@@ -1387,7 +1434,7 @@ def evaluate_all_datasets(args, model, stage="test"):
 
         # Extract data and sub-data identifiers from the path for logging purposes
         segs = data_path.split("/")
-        
+
         data = ""
         subdata = ""
         for s, seg in enumerate(segs):
@@ -1395,23 +1442,27 @@ def evaluate_all_datasets(args, model, stage="test"):
                 data = segs[s + 1]  # Identify dataset name
             if seg in {"train", "test", "val"}:
                 subdata = segs[s - 1]  # Identify subset name
-        
+
         data = f"{data} {subdata}" if subdata != data else data
         datas.append(data)
 
         # Prepare the test dataset and loader
-        test_set = DocSAM_GT([data_path], short_range=args.short_range, patch_size=args.patch_size, patch_num=args.patch_num, keep_size=args.keep_size,stage=stage)
+        test_set = DocSAM_GT([data_path], short_range=args.short_range, patch_size=args.patch_size,
+                             patch_num=args.patch_num, keep_size=args.keep_size, stage=stage)
         test_set = CustomSubset(test_set, range(0, min(args.max_num, len(test_set))))
 
-        gpu_num = len(args.gpus.split(",")) # Count the number of GPUs available
+        gpu_num = len(args.gpus.split(","))  # Count the number of GPUs available
         if gpu_num == 1 or stage == "train":
             # Single-GPU evaluation
-            test_loader = DataLoaderX(test_set, batch_size=1, shuffle=False, num_workers=0, pin_memory=True, collate_fn=test_set.collate_fn)
-            bbox_mAP, mask_mAP, mask_mF1, mIoU = compute_metrics(evaluate(args, model, test_loader, gpu_id=0, save_num=50, stage=stage))
+            test_loader = DataLoaderX(test_set, batch_size=1, shuffle=False, num_workers=0, pin_memory=True,
+                                      collate_fn=test_set.collate_fn)
+            bbox_mAP, mask_mAP, mask_mF1, mIoU = compute_metrics(
+                evaluate(args, model, test_loader, gpu_id=0, save_num=50, stage=stage))
         else:
             # Multi-GPU parallel evaluation
-            bbox_mAP, mask_mAP, mask_mF1, mIoU = compute_metrics(evaluate_parallel(args, model, test_set, save_num=50, stage=stage, thres_num=gpu_num))
-                
+            bbox_mAP, mask_mAP, mask_mF1, mIoU = compute_metrics(
+                evaluate_parallel(args, model, test_set, save_num=50, stage=stage, thres_num=gpu_num))
+
         # Store metrics for the current dataset
         bbox_mAPs.append(bbox_mAP)
         mask_mAPs.append(mask_mAP)
@@ -1428,7 +1479,8 @@ def evaluate_all_datasets(args, model, stage="test"):
     print("mAPs and mF1s:\n")
     for data, bbox_mAP, mask_mAP, mask_mF1, mIoU in zip(datas, bbox_mAPs, mask_mAPs, mask_mF1s, mIoUs):
         print(f"{data}: bbox_mAP: {bbox_mAP}, mask_mAP: {mask_mAP}, mask_mF1: {mask_mF1}, mIoU: {mIoU}")
-    print(f"mean_bbox_mAP: {mean_bbox_mAP}, mean_mask_mAP: {mean_mask_mAP}, mean_mask_mF1: {mean_mask_mF1}, mean_mIoU: {mean_mIoU}")
+    print(
+        f"mean_bbox_mAP: {mean_bbox_mAP}, mean_mask_mAP: {mean_mask_mAP}, mean_mask_mF1: {mean_mask_mF1}, mean_mIoU: {mean_mIoU}")
 
     return mean_bbox_mAP, mean_mask_mAP, mean_mask_mF1, mean_mIoU
 
@@ -1461,8 +1513,11 @@ def inference(args, model, dataloader, gpu_id=0, save_num=50, stage="inference")
             torch.cuda.empty_cache()  # Clear GPU memory cache to free up space
 
             # Move batch data to the specified GPU
-            batch['pixel_values'] = [item.cuda(device) for item in batch['pixel_values']] if isinstance(batch['pixel_values'], list) else batch['pixel_values'].cuda(device)
-            batch['pixel_mask'] = [item.cuda(device) for item in batch['pixel_mask']] if isinstance(batch['pixel_mask'], list) else batch['pixel_mask'].cuda(device)
+            batch['pixel_values'] = [item.cuda(device) for item in batch['pixel_values']] if isinstance(
+                batch['pixel_values'], list) else batch['pixel_values'].cuda(device)
+            batch['pixel_mask'] = [item.cuda(device) for item in batch['pixel_mask']] if isinstance(batch['pixel_mask'],
+                                                                                                    list) else batch[
+                'pixel_mask'].cuda(device)
 
             # Perform inference using a sliding window approach
             batch_results = predict_slide_window(model, batch, patch_size=args.patch_size)
@@ -1507,7 +1562,8 @@ def inference(args, model, dataloader, gpu_id=0, save_num=50, stage="inference")
 
                 # Save detection results to a JSONL file
                 MakePath(os.path.join(args.save_path, dataset_names, image_names + "_instance_dt.jsonl"))
-                with open(os.path.join(args.save_path, dataset_names, image_names + "_instance_dt.jsonl"), "w", encoding="utf-8") as f:
+                with open(os.path.join(args.save_path, dataset_names, image_names + "_instance_dt.jsonl"), "w",
+                          encoding="utf-8") as f:
                     for item in dt:
                         f.write(json.dumps(item, ensure_ascii=False) + "\n")
 
@@ -1518,25 +1574,31 @@ def inference(args, model, dataloader, gpu_id=0, save_num=50, stage="inference")
                 # Save visualizations for the first `save_num` images
                 if img_num < save_num:
                     # Save the original image
-                    image = pixel_values.permute(1, 2, 0).cpu().numpy().astype(np.uint8)[:, :, ::-1]  # Convert to HWC and BGR format
+                    image = pixel_values.permute(1, 2, 0).cpu().numpy().astype(np.uint8)[
+                        :, :, ::-1]  # Convert to HWC and BGR format
                     image = np.ascontiguousarray(image)
                     MakePath(os.path.join(args.save_path, dataset_names, image_names + ".jpg"))
                     PILImage.fromarray(image).save(os.path.join(args.save_path, dataset_names, image_names + ".jpg"))
 
                     # Visualize and save predicted semantic masks
                     image_semantic_dt = copy.deepcopy(image)
-                    semantic_dt = bimask_to_id_mask(results['semantic_maskes'].cpu().numpy())  # Convert binary mask to ID mask
+                    semantic_dt = bimask_to_id_mask(
+                        results['semantic_maskes'].cpu().numpy())  # Convert binary mask to ID mask
                     color_mask = id_map_to_color(semantic_dt, semantic_palette)  # Apply color palette
-                    image_semantic_dt[semantic_dt > 0] = image_semantic_dt[semantic_dt > 0] // 2 + color_mask[semantic_dt > 0] // 2
+                    image_semantic_dt[semantic_dt > 0] = image_semantic_dt[semantic_dt > 0] // 2 + color_mask[
+                        semantic_dt > 0] // 2
                     image_semantic_dt = PILImage.fromarray(image_semantic_dt)
                     MakePath(os.path.join(args.save_path, dataset_names, image_names + "_semantic_dt.png"))
-                    image_semantic_dt.save(os.path.join(args.save_path, dataset_names, image_names + "_semantic_dt.png"))
+                    image_semantic_dt.save(
+                        os.path.join(args.save_path, dataset_names, image_names + "_semantic_dt.png"))
 
                     # Visualize and save instance ground truth masks
                     image_instance_dt = copy.deepcopy(image)
-                    instance_dt = bimask_to_id_mask(results['instance_maskes'][results['instance_scores'] > 0.5].cpu().numpy())
+                    instance_dt = bimask_to_id_mask(
+                        results['instance_maskes'][results['instance_scores'] > 0.5].cpu().numpy())
                     color_mask = id_map_to_color(instance_dt, instance_palette)
-                    image_instance_dt[instance_dt > 0] = image_instance_dt[instance_dt > 0] // 2 + color_mask[instance_dt > 0] // 2
+                    image_instance_dt[instance_dt > 0] = image_instance_dt[instance_dt > 0] // 2 + color_mask[
+                        instance_dt > 0] // 2
 
                     # Draw bounding boxes and class labels for high-confidence predictions
                     for j in range(results['instance_maskes'].size(0)):
@@ -1545,13 +1607,16 @@ def inference(args, model, dataloader, gpu_id=0, save_num=50, stage="inference")
                         bbox = results['instance_bboxes'][j].cpu().numpy().tolist()
                         if score >= 0.5:
                             x1, y1, x2, y2 = bbox[0], bbox[1], bbox[0] + bbox[2], bbox[1] + bbox[3]
-                            cv2.rectangle(image_instance_dt, (int(x1), int(y1)), (int(x2), int(y2)), color=semantic_palette[category_id * 3:category_id * 3 + 3], thickness=2)
+                            cv2.rectangle(image_instance_dt, (int(x1), int(y1)), (int(x2), int(y2)),
+                                          color=semantic_palette[category_id * 3:category_id * 3 + 3], thickness=2)
                             class_score = class_names[category_id - 1] + "-" + str(round(score, 4))
-                            cv2.putText(image_instance_dt, class_score, (int(x1), int(y2)), cv2.FONT_HERSHEY_SIMPLEX, 0.3, semantic_palette[category_id * 3:category_id * 3 + 3], 1)
+                            cv2.putText(image_instance_dt, class_score, (int(x1), int(y2)), cv2.FONT_HERSHEY_SIMPLEX,
+                                        0.3, semantic_palette[category_id * 3:category_id * 3 + 3], 1)
 
                     image_instance_dt = PILImage.fromarray(image_instance_dt)
                     MakePath(os.path.join(args.save_path, dataset_names, image_names + "_instance_dt.png"))
-                    image_instance_dt.save(os.path.join(args.save_path, dataset_names, image_names + "_instance_dt.png"))
+                    image_instance_dt.save(
+                        os.path.join(args.save_path, dataset_names, image_names + "_instance_dt.png"))
 
                     # Visualize and save predicted category masks
                     image_category_dt = copy.deepcopy(image)
@@ -1562,18 +1627,20 @@ def inference(args, model, dataloader, gpu_id=0, save_num=50, stage="inference")
                             category_dt[results['instance_maskes'][j] == 1] = results['instance_labels'][j]
 
                     color_mask = id_map_to_color(category_dt, semantic_palette)
-                    image_category_dt[category_dt > 0] = image_category_dt[category_dt > 0] // 2 + color_mask[category_dt > 0] // 2
+                    image_category_dt[category_dt > 0] = image_category_dt[category_dt > 0] // 2 + color_mask[
+                        category_dt > 0] // 2
                     image_category_dt = PILImage.fromarray(image_category_dt)
                     MakePath(os.path.join(args.save_path, dataset_names, image_names + "_category_dt.png"))
-                    image_category_dt.save(os.path.join(args.save_path, dataset_names, image_names + "_category_dt.png"))
+                    image_category_dt.save(
+                        os.path.join(args.save_path, dataset_names, image_names + "_category_dt.png"))
 
                 img_num += 1  # Increment the image counter
 
     # Restore the model to training mode and clear GPU memory cache
     model.train()
     torch.cuda.empty_cache()
-    
-    
+
+
 def inference_parallel(args, model, dataset, save_num=50, stage="inference", thres_num=None):
     """
     Function to perform parallel inference using multiple processes and GPUs.
@@ -1608,12 +1675,14 @@ def inference_parallel(args, model, dataset, save_num=50, stage="inference", thr
         for i in range(thres_num):
             gpu_id = i % len(args.gpus.split(","))  # Assign a GPU to each process based on available GPUs
             model_i = copy.deepcopy(model)  # Deep copy the model for each process to avoid conflicts
-            subset = CustomSubset(dataset, range(indices[i], indices[i + 1]))  # Create a subset of the dataset for the current process
-            loader = DataLoaderX(subset, batch_size=1, shuffle=False, num_workers=0, pin_memory=True, collate_fn=subset.collate_fn)
-            
+            subset = CustomSubset(dataset, range(indices[i], indices[
+                i + 1]))  # Create a subset of the dataset for the current process
+            loader = DataLoaderX(subset, batch_size=1, shuffle=False, num_workers=0, pin_memory=True,
+                                 collate_fn=subset.collate_fn)
+
             # Submit the evaluation task for the subset to the multiprocessing pool
             results.append(mp_pool.apply_async(
-                inference, 
+                inference,
                 args=(args, model_i, loader, gpu_id, eachThresSaveNum[i], stage)
             ))
 
@@ -1621,7 +1690,7 @@ def inference_parallel(args, model, dataset, save_num=50, stage="inference", thr
         results = [p.get() for p in results]
 
         mp_pool.close()  # Close the multiprocessing pool to prevent new tasks from being submitted
-        mp_pool.join()   # Wait for all processes to complete before proceeding
+        mp_pool.join()  # Wait for all processes to complete before proceeding
 
     return
 
@@ -1644,20 +1713,22 @@ def inference_all_datasets(args, model, stage="inference"):
         print(f"Testing: {index + 1} / {len(args.eval_path)} : {data_path}")
 
         # Prepare the test dataset and loader
-        test_set = DocSAM_GT([data_path], short_range=args.short_range, patch_size=args.patch_size, patch_num=args.patch_num, keep_size=args.keep_size, stage=stage)
+        test_set = DocSAM_GT([data_path], short_range=args.short_range, patch_size=args.patch_size,
+                             patch_num=args.patch_num, keep_size=args.keep_size, stage=stage)
         # Limit the dataset size to `args.max_num` if specified
         test_set = CustomSubset(test_set, range(0, min(args.max_num, len(test_set))))
-        
+
         gpu_num = len(args.gpus.split(","))  # Count the number of GPUs available
 
         if gpu_num == 1:
             # Single-GPU inference
-            test_loader = DataLoaderX(test_set, batch_size=1, shuffle=False, num_workers=0, pin_memory=True, collate_fn=test_set.collate_fn)
+            test_loader = DataLoaderX(test_set, batch_size=1, shuffle=False, num_workers=0, pin_memory=True,
+                                      collate_fn=test_set.collate_fn)
             inference(args, model, test_loader, gpu_id=0, save_num=50, stage=stage)
         else:
             # Multi-GPU parallel inference
             inference_parallel(args, model, test_set, save_num=50, stage=stage, thres_num=gpu_num)
-            
+
     return
 
 
@@ -1671,10 +1742,10 @@ def count_parameters(model):
     Returns:
         float: Number of trainable parameters in millions.
     """
-    
+
     # Sum up the number of elements in all trainable parameters
     params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    
+
     return params / 1e6  # Convert to millions
 
 
@@ -1689,11 +1760,11 @@ def load_para_weights(model, restore_from):
     Returns:
         torch.nn.Module: Model with loaded weights.
     """
-    
+
     # Load the pretrained weights from the specified file
     pre_dict = torch.load(restore_from, weights_only=True, map_location=torch.device('cpu'))
     cur_dict = model.state_dict()  # Get the current model's state dictionary
-    
+
     matched_dict = {}  # Dictionary to store matched keys and weights
     unmatched_keys = []  # List to store unmatched keys
     for k in cur_dict.keys():
@@ -1701,45 +1772,46 @@ def load_para_weights(model, restore_from):
             matched_dict[k] = pre_dict[k]  # Matched key and weight
         else:
             unmatched_keys.append(k)  # Unmatched key
-    
+
     # Log unmatched keys if any
     if unmatched_keys:
         print("Unmatched keys in current model:", unmatched_keys)
-    
+
     # Load matched weights into the model
     model.load_state_dict(matched_dict, strict=False)
     print("Pretrained model loaded!!!", restore_from)
-    
+
     return model
 
 
 if __name__ == '__main__':
     start = timeit.default_timer()
-    
+
     mp.set_start_method('spawn', force=True)
-    
+
     args = get_arguments()
 
     if args.gpus != 'None':
-        os.environ["CUDA_VISIBLE_DEVICES"]=args.gpus
-    
+        os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
+
     # Instantiate the DocSAM model
     model = DocSAM(model_size=args.model_size)
     print("total paras:", count_parameters(model))
-    
+
     # Load pretrained weights into the model if a valid path is provided in 'args.restore_from'
     if os.path.isfile(args.restore_from):
         model = load_para_weights(model, args.restore_from)
-    #model.cuda()
-    
+    # model.cuda()
+
     # Evaluate the model using the test() function. It takes the model, arguments, maximum number of images to process, and the stage.
     print(args.eval_path)
     if args.stage == "train" or args.stage == "test":
         mean_bbox_mAP, mean_mask_mAP, mean_mask_mF1, mean_mIoU = evaluate_all_datasets(args, model, stage=args.stage)
-        print("mean_bbox_mAP:", mean_bbox_mAP, "mean_mask_mAP:", mean_mask_mAP, "mean_mask_mF1:", mean_mask_mF1, "mean_mIoU:", mean_mIoU)
+        print("mean_bbox_mAP:", mean_bbox_mAP, "mean_mask_mAP:", mean_mask_mAP, "mean_mask_mF1:", mean_mask_mF1,
+              "mean_mIoU:", mean_mIoU)
     else:
         inference_all_datasets(args, model, stage=args.stage)
 
     # Record the end time and calculate the total execution time.
     end = timeit.default_timer()
-    print('total time:', end-start,'seconds')
+    print('total time:', end - start, 'seconds')
