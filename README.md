@@ -25,6 +25,10 @@ pip install -r requirments.txt
 ```
 
 ## Getting Started
+
+### Windows 11 Notes
+For a Windows-first setup (including `fbgemm.dll` / WinError 127 troubleshooting), see [WINDOWS.md](WINDOWS.md).
+
 ### Preparing Datasets
 All dataset annotations must be converted to the unified COCO format. We provide a [demo dataset](https://drive.google.com/file/d/1gvfco5zyRDASGO2BOYCjZuRxbN7MHhsT/view?usp=drive_link) to illustrate the structure and format of the datasets used during training and testing. Please download it and place it in the designated 'data' folder. You can prepare your own data according to the structure and guidelines outlined in this demo dataset.
 

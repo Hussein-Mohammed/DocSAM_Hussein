@@ -1,5 +1,37 @@
 
 import os
+import sys
+from pathlib import Path
+
+# Windows runtime guard: normalize DLL search paths before importing torch.
+if os.name == "nt":
+    os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("CONDA_DLL_SEARCH_MODIFICATION_ENABLE", "1")
+
+    env_prefix = Path(sys.prefix)
+    preferred = [
+        env_prefix / "Library" / "bin",
+        env_prefix / "DLLs",
+        env_prefix / "Lib" / "site-packages" / "torch" / "lib",
+    ]
+
+    # Drop base-conda Library/bin if it's not the active env to avoid stale DLLs.
+    path_items = []
+    for item in os.environ.get("PATH", "").split(os.pathsep):
+        low = item.lower()
+        if "anaconda3" in low and "library\bin" in low and not str(env_prefix).lower() in low:
+            continue
+        path_items.append(item)
+
+    for dll_dir in reversed([str(d) for d in preferred if d.exists()]):
+        path_items.insert(0, dll_dir)
+        try:
+            os.add_dll_directory(dll_dir)
+        except (AttributeError, FileNotFoundError, OSError):
+            pass
+
+    os.environ["PATH"] = os.pathsep.join(path_items)
 import timeit
 import random
 from tqdm import tqdm
@@ -12,14 +44,6 @@ import numpy as np
 np.set_printoptions(linewidth=400)
 np.set_printoptions(precision=4)
 
-import cv2
-from PIL import Image as PILImage
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
-from pycocotools.coco import COCO
-from pycocotools.cocoeval import COCOeval
-import pycocotools.mask as mask_utils
-from scipy.optimize import linear_sum_assignment
-
 import gc
 import torch
 import torch.nn as nn
@@ -28,6 +52,14 @@ import torch.nn.functional as F
 from torchvision.ops import box_iou
 from torch.nn.utils.rnn import pad_sequence
 from prefetch_generator import BackgroundGenerator
+
+import cv2
+from PIL import Image as PILImage
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
+from pycocotools.coco import COCO
+from pycocotools.cocoeval import COCOeval
+import pycocotools.mask as mask_utils
+from scipy.optimize import linear_sum_assignment
 
 from datasets.dataset import DocSAM_GT
 from models.DocSAM import DocSAM 
