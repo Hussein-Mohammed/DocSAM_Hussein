@@ -312,23 +312,35 @@ if __name__ == '__main__':
     # optimizer = optim.SGD(params, lr=args.learning_rate, momentum=args.momentum, weight_decay=args.weight_decay)
     optimizer = optim.AdamW(params, lr=args.learning_rate, weight_decay=args.weight_decay)
 
-    # Initialize distributed training environment
-    # os.environ['NCCL_BLOCKING_WAIT'] = '0'  # not to enforce timeout
-    backend = 'gloo' if os.name == 'nt' else 'nccl'
-    dist.init_process_group(backend=backend, timeout=datetime.timedelta(seconds=3600))
-    local_rank = int(os.environ['LOCAL_RANK'])
-    torch.cuda.set_device(local_rank)
-    model.cuda(local_rank)
-    model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model, process_group=None)
-    model = nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], find_unused_parameters=True)
+    # Determine distributed vs single-GPU mode
+    num_gpus = len(args.gpus.split(','))
+    distributed = num_gpus > 1 and 'RANK' in os.environ
+
+    if distributed:
+        backend = 'gloo' if os.name == 'nt' else 'nccl'
+        dist.init_process_group(backend=backend, timeout=datetime.timedelta(seconds=3600))
+        local_rank = int(os.environ['LOCAL_RANK'])
+        torch.cuda.set_device(local_rank)
+        model.cuda(local_rank)
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model, process_group=None)
+        model = nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], find_unused_parameters=True)
+    else:
+        local_rank = 0
+        device = torch.device(f'cuda:{args.gpus}')
+        torch.cuda.set_device(device)
+        model.cuda(device)
     model.train()
 
     # Create training dataset and loader
     train_set = DocSAM_GT(args.train_path, short_range=args.short_range, patch_size=args.patch_size,
                           patch_num=args.patch_num, keep_size=args.keep_size, stage="train")
-    train_sampler = torch.utils.data.distributed.DistributedSampler(train_set, shuffle=True)
-    train_loader = DataLoaderX(train_set, batch_size=int(args.batch_size / len(args.gpus.split(','))), num_workers=4,
-                               pin_memory=True, sampler=train_sampler, collate_fn=train_set.collate_fn)
+    if distributed:
+        train_sampler = torch.utils.data.distributed.DistributedSampler(train_set, shuffle=True)
+    else:
+        train_sampler = None
+    train_loader = DataLoaderX(train_set, batch_size=int(args.batch_size / num_gpus), num_workers=4,
+                               pin_memory=True, sampler=train_sampler, shuffle=(train_sampler is None),
+                               collate_fn=train_set.collate_fn)
 
     # Create snapshot directory if it does not exist
     if not os.path.exists(args.snapshot_dir):
@@ -350,7 +362,8 @@ if __name__ == '__main__':
     for i_epoch in range(num_epoch):
         if flag == False:
             break
-        train_sampler.set_epoch(i_epoch)
+        if distributed:
+            train_sampler.set_epoch(i_epoch)
         for i_iter, batch in enumerate(train_loader, start=1):
             current_iter = args.start_iter + i_epoch * num_iters + i_iter
 
@@ -390,13 +403,14 @@ if __name__ == '__main__':
             if current_iter % 200 == 0 or current_iter == args.total_iter:
                 if local_rank == 0:
                     bbox_mAP, mask_mAP, mask_mF1, mIoU = evaluate_all_datasets(args, model, stage="train")
+                    raw_model = model.module if distributed else model
                     if mask_mAP > max_mask_mAP:
                         print(datetime.datetime.now(),
                               'Best model updated, mAP: {:.4f}-->{:.4f}, taking snapshot...'.format(max_mask_mAP,
                                                                                                     mask_mAP))
-                        torch.save(model.module.state_dict(), os.path.join(args.snapshot_dir, 'best_model.pth'))
+                        torch.save(raw_model.state_dict(), os.path.join(args.snapshot_dir, 'best_model.pth'))
                         max_mask_mAP = mask_mAP
-                    torch.save(model.module.state_dict(), os.path.join(args.snapshot_dir, 'last_model.pth'))
+                    torch.save(raw_model.state_dict(), os.path.join(args.snapshot_dir, 'last_model.pth'))
                     print(datetime.datetime.now(), 'Best model mAP: {:.4f},'.format(max_mask_mAP))
                 torch.cuda.empty_cache()
 
