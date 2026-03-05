@@ -4,3 +4,4 @@ outputs/
 pretrained_model/
 snapshots/
 temp/
+__pycache__/
