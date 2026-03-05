@@ -1,9 +1,36 @@
 import os
+import sys
+from pathlib import Path
 
-# Windows OpenMP runtime guard (libomp/libiomp duplicate load)
+# Windows runtime guard: normalize DLL search paths before importing torch.
 if os.name == "nt":
     os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
     os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("CONDA_DLL_SEARCH_MODIFICATION_ENABLE", "1")
+
+    env_prefix = Path(sys.prefix)
+    preferred = [
+        env_prefix / "Library" / "bin",
+        env_prefix / "DLLs",
+        env_prefix / "Lib" / "site-packages" / "torch" / "lib",
+    ]
+
+    # Drop base-conda Library/bin if it's not the active env to avoid stale DLLs.
+    path_items = []
+    for item in os.environ.get("PATH", "").split(os.pathsep):
+        low = item.lower()
+        if "anaconda3" in low and "library\bin" in low and not str(env_prefix).lower() in low:
+            continue
+        path_items.append(item)
+
+    for dll_dir in reversed([str(d) for d in preferred if d.exists()]):
+        path_items.insert(0, dll_dir)
+        try:
+            os.add_dll_directory(dll_dir)
+        except (AttributeError, FileNotFoundError, OSError):
+            pass
+
+    os.environ["PATH"] = os.pathsep.join(path_items)
 import timeit
 import random
 from tqdm import tqdm
@@ -12,6 +39,7 @@ import argparse
 import math
 import json
 import copy
+import pickle
 import numpy as np
 
 np.set_printoptions(linewidth=400)
@@ -937,7 +965,7 @@ def predict_slide_window(model, batch, patch_size, layer_idx=-1):
                 # Detect boundary instances and reduce their confidence scores
                 bboxes = mask_bbox(instance_maskes)
                 indexes = (bboxes[:, 0] < 4) | (bboxes[:, 1] < 4) | (bboxes[:, 2] > patch_size[1] - 4) | (
-                            bboxes[:, 3] > patch_size[0] - 4)
+                        bboxes[:, 3] > patch_size[0] - 4)
                 instance_scores[indexes] = instance_scores[indexes] * 0.5
 
                 # Map patch coordinates back to the original image coordinate system
@@ -1262,7 +1290,7 @@ def evaluate_parallel(args, model, dataset, save_num=50, stage="test", thres_num
 
     # Aggregate results from all processes
     coco_gt, coco_dt, semantic_true_nums, semantic_pred_nums, semantic_correct_nums, all_true_nums, all_pred_nums, all_tp_nums = \
-    results[0]
+        results[0]
     for idx in range(1, thres_num):
         # Combine COCO ground truth and detection structures
         coco_gt["images"] += results[idx][0]["images"]
@@ -1361,7 +1389,7 @@ def compute_metrics(results):
         class_num = 0  # Counter for valid classes
         for i in range(len(coco_gt["categories"])):  # Iterate over categories
             if all_true_nums[i] == 0 and all_pred_nums[i] == 0:
-                continue  # Skip classes with no true or predicted instances
+                continue  # Skip   with no true or predicted instances
 
             # Compute precision, recall, and F1-score for each IoU threshold
             P = [item / max(all_pred_nums[i], 1) for item in all_tp_nums[i]]  # Precision
@@ -1761,8 +1789,18 @@ def load_para_weights(model, restore_from):
         torch.nn.Module: Model with loaded weights.
     """
 
-    # Load the pretrained weights from the specified file
-    pre_dict = torch.load(restore_from, weights_only=True, map_location=torch.device('cpu'))
+    try:
+        pre_dict = torch.load(restore_from, weights_only=True, map_location=torch.device('cpu'))
+    except pickle.UnpicklingError:
+        print("`weights_only=True` is incompatible with this checkpoint. "
+              "Retrying with `weights_only=False` for trusted local file:", restore_from)
+        pre_dict = torch.load(restore_from, weights_only=False, map_location=torch.device('cpu'))
+
+    if isinstance(pre_dict, dict):
+        for key in ('state_dict', 'model_state_dict', 'model'):
+            if key in pre_dict and isinstance(pre_dict[key], dict):
+                pre_dict = pre_dict[key]
+                break
     cur_dict = model.state_dict()  # Get the current model's state dictionary
 
     matched_dict = {}  # Dictionary to store matched keys and weights
