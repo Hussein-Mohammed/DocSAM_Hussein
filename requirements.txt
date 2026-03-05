@@ -2,7 +2,6 @@ accelerate==1.1.1
 einops==0.8.1
 huggingface_hub==0.26.3
 jpeg4py==0.1.4
-Mask2Former==0.1.5
 numpy==2.2.4
 opencv_python==4.10.0.84
 Pillow==11.1.0
