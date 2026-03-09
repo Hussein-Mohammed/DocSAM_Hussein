@@ -183,15 +183,15 @@ class CustomSubset(Subset):
 
 # ── Geometric classification (orientation + scale) ────────────────────────────
 #
-# Orientation: determined by analysing the *internal structure* of the text
-#   region — specifically, the direction of text lines via projection profiles.
-#   We rotate the mask at many angles; the angle whose horizontal projection
-#   has the sharpest peaks (highest variance) is the one where text lines
-#   align with rows → that angle = the text baseline direction.
+# Both orientation and scale are derived from connected-component (CC) analysis
+# of the binary text-region mask.  This approach:
+#   - Handles curved baselines (centroids follow the curve naturally)
+#   - Tolerates overlapping text lines (CC heights stay correct)
+#   - Works for both Latin and Arabic/RTL scripts (diacritics filtered by size)
+#   - Measures actual character/word size, not text-block size
 #
-# Scale: determined by the *height of individual text lines*, not the area of
-#   the text block.  After finding the baseline direction we examine the
-#   projection profile perpendicular to it to measure line heights.
+# Orientation: PCA on CC centroids → dominant direction = baseline direction.
+# Scale:       median CC bounding-box height → character/word height.
 
 
 def _crop_mask(mask_np):
@@ -204,123 +204,125 @@ def _crop_mask(mask_np):
     return mask_np[y1:y2, x1:x2], y1, x1
 
 
-def _rotate_mask(crop, angle_deg):
-    """Rotate a mask crop by *angle_deg* (counter-clockwise) with auto-resize."""
-    if angle_deg == 0:
-        return crop.copy()
-    h, w = crop.shape
-    cx, cy = w / 2.0, h / 2.0
-    M = cv2.getRotationMatrix2D((cx, cy), angle_deg, 1.0)
-    cos, sin = abs(M[0, 0]), abs(M[0, 1])
-    nw = int(h * sin + w * cos)
-    nh = int(h * cos + w * sin)
-    M[0, 2] += (nw - w) / 2.0
-    M[1, 2] += (nh - h) / 2.0
-    return cv2.warpAffine(crop, M, (nw, nh), flags=cv2.INTER_NEAREST)
+def _find_components(mask_np):
+    """Find connected components and return their stats, filtering noise.
+
+    Removes CCs whose area is less than 10 % of the median CC area (catches
+    diacritical marks in Arabic, dots on i/j in Latin, punctuation, noise).
+    Also drops CCs smaller than 4 px unconditionally.
+
+    Returns a list of dicts with: centroid_x, centroid_y, height, width, area.
+    """
+    n_labels, _labels, stats, centroids = cv2.connectedComponentsWithStats(
+        mask_np, connectivity=8)
+    if n_labels <= 1:
+        return []
+
+    comps = []
+    for i in range(1, n_labels):  # skip background
+        comps.append({
+            "centroid_x": float(centroids[i, 0]),
+            "centroid_y": float(centroids[i, 1]),
+            "height": int(stats[i, cv2.CC_STAT_HEIGHT]),
+            "width": int(stats[i, cv2.CC_STAT_WIDTH]),
+            "area": int(stats[i, cv2.CC_STAT_AREA]),
+        })
+
+    if not comps:
+        return []
+
+    median_area = float(np.median([c["area"] for c in comps]))
+    min_area = max(median_area * 0.1, 4)
+    return [c for c in comps if c["area"] >= min_area]
 
 
-def _projection_profile(mask_2d):
-    """Sum along columns → one value per row (horizontal projection)."""
-    return mask_2d.astype(np.float32).sum(axis=1)
+def estimate_baseline_angle(mask_np):
+    """Estimate text baseline angle from CC centroids using PCA.
 
+    PCA on the 2-D centroid cloud gives the principal axis = the direction
+    along which centroids spread the most.  For text, that is the reading
+    direction (baseline direction).
 
-def estimate_baseline_angle(mask_np, angle_step=5):
-    """Find the text baseline angle via projection-profile variance.
-
-    We try rotating the mask from 0° to 175° in *angle_step* increments.
-    At each angle the mask is rotated so that, if text lines really run at
-    that angle, they become horizontal rows.  The horizontal projection
-    profile will then show the sharpest peaks → highest variance.
+    Works with curved lines (PCA captures the dominant trend), overlapping
+    lines, and any script direction (LTR, RTL, vertical).
 
     Returns:
-        best_angle (float): baseline angle in [0, 180) degrees.
-            0° = horizontal text, 90° = vertical text.
-        label (str): "horizontal" / "vertical" / "tilted"
+        angle (float): baseline angle in [0, 180) degrees.
+            0° ≈ horizontal, 90° ≈ vertical.
+        label (str): "horizontal" / "vertical" / "tilted" / "unknown"
     """
     crop, _, _ = _crop_mask(mask_np)
-    if crop is None or crop.shape[0] < 3 or crop.shape[1] < 3:
+    if crop is None:
         return 0.0, "unknown"
 
-    best_angle = 0
-    best_var = -1.0
+    comps = _find_components(crop)
+    if len(comps) < 2:
+        return 0.0, "unknown"
 
-    for angle in range(0, 180, angle_step):
-        rotated = _rotate_mask(crop, angle)
-        profile = _projection_profile(rotated)
-        if len(profile) < 3:
-            continue
-        v = float(np.var(profile))
-        if v > best_var:
-            best_var = v
-            best_angle = angle
+    pts = np.array([[c["centroid_x"], c["centroid_y"]] for c in comps])
+    centered = pts - pts.mean(axis=0)
 
-    # Refine ±angle_step around the best with 1° steps
-    lo = max(0, best_angle - angle_step)
-    hi = min(179, best_angle + angle_step)
-    for angle in range(lo, hi + 1):
-        rotated = _rotate_mask(crop, angle)
-        profile = _projection_profile(rotated)
-        if len(profile) < 3:
-            continue
-        v = float(np.var(profile))
-        if v > best_var:
-            best_var = v
-            best_angle = angle
+    # 2×2 covariance → eigenvectors
+    cov = np.cov(centered.T)
+    eigvals, eigvecs = np.linalg.eigh(cov)  # ascending order
+    # Principal component = eigenvector with the largest eigenvalue (last)
+    pc = eigvecs[:, -1]
+    angle = float(np.degrees(np.arctan2(pc[1], pc[0])) % 180)
 
-    best_angle = best_angle % 180
-
-    if best_angle < 15 or best_angle > 165:
+    if angle < 15 or angle > 165:
         label = "horizontal"
-    elif 75 < best_angle < 105:
+    elif 75 < angle < 105:
         label = "vertical"
     else:
         label = "tilted"
 
-    return float(best_angle), label
+    return round(angle, 1), label
 
 
 def estimate_line_height(mask_np, baseline_angle):
-    """Estimate median text-line height in pixels.
+    """Estimate text-line height and line count from CC bounding-box heights.
 
-    After rotating the mask so that text lines are horizontal, the
-    horizontal projection profile shows peaks (text rows) separated by
-    valleys (inter-line gaps).  We threshold the profile and measure the
-    height (run-length) of each peak.
+    Line height = median CC height (after filtering diacritics/noise).
+    This directly measures character/word size regardless of block size,
+    line curvature, or overlap.
+
+    Line count is estimated by projecting CC centroids onto the axis
+    *perpendicular* to the baseline and counting clusters separated by
+    gaps larger than 0.7 × median_height.
 
     Returns:
-        line_height_px (int): median line height in pixels (0 if unknown).
+        line_height_px (int): median CC height in pixels (0 if unknown).
         n_lines (int): estimated number of text lines.
     """
     crop, _, _ = _crop_mask(mask_np)
     if crop is None:
         return 0, 0
 
-    rotated = _rotate_mask(crop, baseline_angle)
-    profile = _projection_profile(rotated)
-    if len(profile) < 2:
+    comps = _find_components(crop)
+    if not comps:
         return 0, 0
 
-    # Threshold at 30% of peak value to separate text from gaps
-    thr = profile.max() * 0.3
-    is_text = profile > thr
-
-    # Measure runs of consecutive True values → each run ≈ one text line
-    runs = []
-    run_len = 0
-    for v in is_text:
-        if v:
-            run_len += 1
-        else:
-            if run_len > 0:
-                runs.append(run_len)
-            run_len = 0
-    if run_len > 0:
-        runs.append(run_len)
-
-    if not runs:
+    heights = [c["height"] for c in comps]
+    median_h = int(np.median(heights))
+    if median_h <= 0:
         return 0, 0
 
-    return int(np.median(runs)), len(runs)
+    # Project centroids onto the perpendicular of the baseline
+    perp_rad = np.radians(baseline_angle + 90.0)
+    perp = np.array([np.cos(perp_rad), np.sin(perp_rad)])
+    projections = sorted(
+        c["centroid_x"] * perp[0] + c["centroid_y"] * perp[1]
+        for c in comps
+    )
+
+    # Count lines: consecutive projections separated by > 0.7 × median_h
+    gap_thr = median_h * 0.7
+    n_lines = 1
+    for i in range(1, len(projections)):
+        if projections[i] - projections[i - 1] > gap_thr:
+            n_lines += 1
+
+    return median_h, n_lines
 
 
 def classify_scale(line_height_px, image_height):
