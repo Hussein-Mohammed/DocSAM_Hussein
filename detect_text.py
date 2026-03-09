@@ -180,6 +180,92 @@ class CustomSubset(Subset):
 
 # ── Visualisation helpers ─────────────────────────────────────────────────────
 
+
+# ── Geometric classification (orientation + scale) ────────────────────────────
+
+def classify_orientation(mask_np):
+    """Classify a binary mask's orientation using its minimum-area rotated rect.
+
+    Returns (orientation_label, angle_degrees):
+        orientation_label: one of "horizontal", "vertical", "tilted", "flipped"
+        angle_degrees: the raw angle from minAreaRect (for the label on the viz)
+
+    cv2.minAreaRect returns an angle in [-90, 0).  We normalise so that:
+        - 0° means the longer side is horizontal
+        - 90° means the longer side is vertical
+
+    "flipped" is detected when the rotated rect is nearly 180° from horizontal
+    (i.e. text that is upside-down).  Since minAreaRect can't truly distinguish
+    upside-down from right-side-up (it has no notion of reading direction), we
+    approximate: if the angle is very close to ±180° we call it "flipped".  In
+    practice this means almost-horizontal regions where the rect happened to
+    snap to the 180° equivalent — genuinely upside-down text requires OCR to
+    confirm, so treat "flipped" as a *hint*.
+    """
+    contours, _ = cv2.findContours(mask_np, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return "unknown", 0.0
+
+    # Merge all contour points
+    pts = np.concatenate(contours)
+    if len(pts) < 5:
+        return "unknown", 0.0
+
+    rect = cv2.minAreaRect(pts)          # ((cx,cy), (w,h), angle)
+    (w, h), angle = rect[1], rect[2]
+
+    # Normalise: make angle represent deviation of the *longer* side from horizontal
+    if w < h:
+        angle = angle + 90.0             # rotate so longer side drives the angle
+
+    # angle is now in roughly [0, 180)
+    angle = angle % 180.0
+
+    if angle > 170 or angle < 10:
+        label = "horizontal"
+    elif 80 < angle < 100:
+        label = "vertical"
+    else:
+        label = "tilted"
+
+    return label, round(angle, 1)
+
+
+def classify_scale(mask_np, image_shape):
+    """Classify a mask's scale relative to the image.
+
+    Returns (scale_label, area_ratio):
+        scale_label: "small", "medium", or "large"
+        area_ratio:  mask_area / image_area
+    """
+    mask_area = float(mask_np.sum())
+    image_area = float(image_shape[0] * image_shape[1])
+    ratio = mask_area / max(image_area, 1.0)
+
+    if ratio < 0.01:
+        label = "small"
+    elif ratio < 0.10:
+        label = "medium"
+    else:
+        label = "large"
+
+    return label, round(ratio, 5)
+
+
+def classify_region(mask_np, image_shape):
+    """Return a combined descriptor like 'small tilted' and raw measurements."""
+    orient, angle = classify_orientation(mask_np)
+    scale, ratio = classify_scale(mask_np, image_shape)
+    descriptor = f"{scale} {orient}"
+    return {
+        "descriptor": descriptor,
+        "orientation": orient,
+        "angle": angle,
+        "scale": scale,
+        "area_ratio": ratio,
+    }
+
+
 def random_palette(n):
     """Return a flat list of 3*n random RGB values; index 0 is black (background)."""
     pal = [0, 0, 0]
@@ -523,20 +609,28 @@ def run_inference(args, model, dataloader, gpu_id=0):
                 x1, y1, x2, y2 = batch["image_bboxes"][i]
                 pixel_values = batch["pixel_values"][i][:, y1:y2, x1:x2]
 
-                print(f"  {image_name}: {(results['instance_scores'] >= score_thr).sum().item()} text regions (>={score_thr})")
+                n_kept = (results['instance_scores'] >= score_thr).sum().item()
+                print(f"  {image_name}: {n_kept} text regions (>={score_thr})")
 
-                # ── Save detections as JSONL ──────────────────────────────
+                # ── Classify each region and save as JSONL ───────────────
+                img_h, img_w = pixel_values.shape[1], pixel_values.shape[2]
                 detections = []
                 for j in range(results["instance_maskes"].size(0)):
                     label_idx = results["instance_labels"][j].item()
                     score = results["instance_scores"][j].item()
                     cat_name = class_names[label_idx - 1]
                     mask_np = results["instance_maskes"][j].cpu().numpy().astype(np.uint8)
+                    geo = classify_region(mask_np, (img_h, img_w))
                     rle = mask_utils.encode(np.asfortranarray(mask_np))
                     rle["counts"] = rle["counts"].decode("utf-8")
                     bbox = results["instance_bboxes"][j].cpu().numpy().tolist()
                     detections.append({
                         "category": cat_name,
+                        "descriptor": geo["descriptor"],
+                        "orientation": geo["orientation"],
+                        "angle": geo["angle"],
+                        "scale": geo["scale"],
+                        "area_ratio": geo["area_ratio"],
                         "bbox": bbox,
                         "segmentation": rle,
                         "score": round(score, 4),
@@ -570,19 +664,19 @@ def run_inference(args, model, dataloader, gpu_id=0):
                     colours = id_map_to_color(inst_id, inst_palette)
                     vis[inst_id > 0] = vis[inst_id > 0] // 2 + colours[inst_id > 0] // 2
 
-                for j in range(results["instance_maskes"].size(0)):
+                for j, det in enumerate(detections):
                     score = results["instance_scores"][j].item()
                     if score < score_thr:
                         continue
                     label_idx = results["instance_labels"][j].item()
-                    cat_name = class_names[label_idx - 1]
                     bbox = results["instance_bboxes"][j].cpu().numpy().tolist()
                     bx1, by1 = int(bbox[0]), int(bbox[1])
                     bx2, by2 = int(bbox[0] + bbox[2]), int(bbox[1] + bbox[3])
                     colour = sem_palette[label_idx * 3: label_idx * 3 + 3]
                     cv2.rectangle(vis, (bx1, by1), (bx2, by2), color=colour, thickness=2)
-                    label_text = f"{cat_name} {score:.2f}"
-                    cv2.putText(vis, label_text, (bx1, by2 + 12), cv2.FONT_HERSHEY_SIMPLEX, 0.4, colour, 1)
+                    # Show: category | descriptor | score
+                    label_text = f"{det['category']} | {det['descriptor']} | {score:.2f}"
+                    cv2.putText(vis, label_text, (bx1, by2 + 12), cv2.FONT_HERSHEY_SIMPLEX, 0.35, colour, 1)
 
                 det_path = os.path.join(out_dir, image_name + "_text_instances.png")
                 make_path(det_path)
