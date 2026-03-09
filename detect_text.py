@@ -182,87 +182,187 @@ class CustomSubset(Subset):
 
 
 # ── Geometric classification (orientation + scale) ────────────────────────────
+#
+# Orientation: determined by analysing the *internal structure* of the text
+#   region — specifically, the direction of text lines via projection profiles.
+#   We rotate the mask at many angles; the angle whose horizontal projection
+#   has the sharpest peaks (highest variance) is the one where text lines
+#   align with rows → that angle = the text baseline direction.
+#
+# Scale: determined by the *height of individual text lines*, not the area of
+#   the text block.  After finding the baseline direction we examine the
+#   projection profile perpendicular to it to measure line heights.
 
-def classify_orientation(mask_np):
-    """Classify a binary mask's orientation using its minimum-area rotated rect.
 
-    Returns (orientation_label, angle_degrees):
-        orientation_label: one of "horizontal", "vertical", "tilted", "flipped"
-        angle_degrees: the raw angle from minAreaRect (for the label on the viz)
+def _crop_mask(mask_np):
+    """Crop a binary mask to its bounding box.  Returns (crop, y1, x1)."""
+    ys, xs = np.where(mask_np > 0)
+    if len(ys) == 0:
+        return None, 0, 0
+    y1, y2 = ys.min(), ys.max() + 1
+    x1, x2 = xs.min(), xs.max() + 1
+    return mask_np[y1:y2, x1:x2], y1, x1
 
-    cv2.minAreaRect returns an angle in [-90, 0).  We normalise so that:
-        - 0° means the longer side is horizontal
-        - 90° means the longer side is vertical
 
-    "flipped" is detected when the rotated rect is nearly 180° from horizontal
-    (i.e. text that is upside-down).  Since minAreaRect can't truly distinguish
-    upside-down from right-side-up (it has no notion of reading direction), we
-    approximate: if the angle is very close to ±180° we call it "flipped".  In
-    practice this means almost-horizontal regions where the rect happened to
-    snap to the 180° equivalent — genuinely upside-down text requires OCR to
-    confirm, so treat "flipped" as a *hint*.
+def _rotate_mask(crop, angle_deg):
+    """Rotate a mask crop by *angle_deg* (counter-clockwise) with auto-resize."""
+    if angle_deg == 0:
+        return crop.copy()
+    h, w = crop.shape
+    cx, cy = w / 2.0, h / 2.0
+    M = cv2.getRotationMatrix2D((cx, cy), angle_deg, 1.0)
+    cos, sin = abs(M[0, 0]), abs(M[0, 1])
+    nw = int(h * sin + w * cos)
+    nh = int(h * cos + w * sin)
+    M[0, 2] += (nw - w) / 2.0
+    M[1, 2] += (nh - h) / 2.0
+    return cv2.warpAffine(crop, M, (nw, nh), flags=cv2.INTER_NEAREST)
+
+
+def _projection_profile(mask_2d):
+    """Sum along columns → one value per row (horizontal projection)."""
+    return mask_2d.astype(np.float32).sum(axis=1)
+
+
+def estimate_baseline_angle(mask_np, angle_step=5):
+    """Find the text baseline angle via projection-profile variance.
+
+    We try rotating the mask from 0° to 175° in *angle_step* increments.
+    At each angle the mask is rotated so that, if text lines really run at
+    that angle, they become horizontal rows.  The horizontal projection
+    profile will then show the sharpest peaks → highest variance.
+
+    Returns:
+        best_angle (float): baseline angle in [0, 180) degrees.
+            0° = horizontal text, 90° = vertical text.
+        label (str): "horizontal" / "vertical" / "tilted"
     """
-    contours, _ = cv2.findContours(mask_np, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return "unknown", 0.0
+    crop, _, _ = _crop_mask(mask_np)
+    if crop is None or crop.shape[0] < 3 or crop.shape[1] < 3:
+        return 0.0, "unknown"
 
-    # Merge all contour points
-    pts = np.concatenate(contours)
-    if len(pts) < 5:
-        return "unknown", 0.0
+    best_angle = 0
+    best_var = -1.0
 
-    rect = cv2.minAreaRect(pts)          # ((cx,cy), (w,h), angle)
-    (w, h), angle = rect[1], rect[2]
+    for angle in range(0, 180, angle_step):
+        rotated = _rotate_mask(crop, angle)
+        profile = _projection_profile(rotated)
+        if len(profile) < 3:
+            continue
+        v = float(np.var(profile))
+        if v > best_var:
+            best_var = v
+            best_angle = angle
 
-    # Normalise: make angle represent deviation of the *longer* side from horizontal
-    if w < h:
-        angle = angle + 90.0             # rotate so longer side drives the angle
+    # Refine ±angle_step around the best with 1° steps
+    lo = max(0, best_angle - angle_step)
+    hi = min(179, best_angle + angle_step)
+    for angle in range(lo, hi + 1):
+        rotated = _rotate_mask(crop, angle)
+        profile = _projection_profile(rotated)
+        if len(profile) < 3:
+            continue
+        v = float(np.var(profile))
+        if v > best_var:
+            best_var = v
+            best_angle = angle
 
-    # angle is now in roughly [0, 180)
-    angle = angle % 180.0
+    best_angle = best_angle % 180
 
-    if angle > 170 or angle < 10:
+    if best_angle < 15 or best_angle > 165:
         label = "horizontal"
-    elif 80 < angle < 100:
+    elif 75 < best_angle < 105:
         label = "vertical"
     else:
         label = "tilted"
 
-    return label, round(angle, 1)
+    return float(best_angle), label
 
 
-def classify_scale(mask_np, image_shape):
-    """Classify a mask's scale relative to the image.
+def estimate_line_height(mask_np, baseline_angle):
+    """Estimate median text-line height in pixels.
 
-    Returns (scale_label, area_ratio):
-        scale_label: "small", "medium", or "large"
-        area_ratio:  mask_area / image_area
+    After rotating the mask so that text lines are horizontal, the
+    horizontal projection profile shows peaks (text rows) separated by
+    valleys (inter-line gaps).  We threshold the profile and measure the
+    height (run-length) of each peak.
+
+    Returns:
+        line_height_px (int): median line height in pixels (0 if unknown).
+        n_lines (int): estimated number of text lines.
     """
-    mask_area = float(mask_np.sum())
-    image_area = float(image_shape[0] * image_shape[1])
-    ratio = mask_area / max(image_area, 1.0)
+    crop, _, _ = _crop_mask(mask_np)
+    if crop is None:
+        return 0, 0
 
-    if ratio < 0.01:
+    rotated = _rotate_mask(crop, baseline_angle)
+    profile = _projection_profile(rotated)
+    if len(profile) < 2:
+        return 0, 0
+
+    # Threshold at 30% of peak value to separate text from gaps
+    thr = profile.max() * 0.3
+    is_text = profile > thr
+
+    # Measure runs of consecutive True values → each run ≈ one text line
+    runs = []
+    run_len = 0
+    for v in is_text:
+        if v:
+            run_len += 1
+        else:
+            if run_len > 0:
+                runs.append(run_len)
+            run_len = 0
+    if run_len > 0:
+        runs.append(run_len)
+
+    if not runs:
+        return 0, 0
+
+    return int(np.median(runs)), len(runs)
+
+
+def classify_scale(line_height_px, image_height):
+    """Classify text scale from the estimated line height.
+
+    Thresholds are expressed as line_height / image_height:
+        small  : < 1.5% of image height   (fine print, footnotes)
+        medium : 1.5% – 4%                (body text)
+        large  : > 4%                      (titles, headings)
+
+    Returns (label, ratio).
+    """
+    if line_height_px <= 0 or image_height <= 0:
+        return "unknown", 0.0
+    ratio = line_height_px / image_height
+    if ratio < 0.015:
         label = "small"
-    elif ratio < 0.10:
+    elif ratio < 0.04:
         label = "medium"
     else:
         label = "large"
-
     return label, round(ratio, 5)
 
 
 def classify_region(mask_np, image_shape):
-    """Return a combined descriptor like 'small tilted' and raw measurements."""
-    orient, angle = classify_orientation(mask_np)
-    scale, ratio = classify_scale(mask_np, image_shape)
-    descriptor = f"{scale} {orient}"
+    """Return a combined descriptor and raw measurements for a text region.
+
+    image_shape: (H, W) of the full image.
+    """
+    angle, orient = estimate_baseline_angle(mask_np)
+    line_h, n_lines = estimate_line_height(mask_np, angle)
+    scale, ratio = classify_scale(line_h, image_shape[0])
+    descriptor = f"{scale} {orient}" if scale != "unknown" else orient
+
     return {
         "descriptor": descriptor,
         "orientation": orient,
         "angle": angle,
         "scale": scale,
-        "area_ratio": ratio,
+        "line_height_px": line_h,
+        "line_height_ratio": ratio,
+        "n_lines": n_lines,
     }
 
 
@@ -628,9 +728,11 @@ def run_inference(args, model, dataloader, gpu_id=0):
                         "category": cat_name,
                         "descriptor": geo["descriptor"],
                         "orientation": geo["orientation"],
-                        "angle": geo["angle"],
+                        "baseline_angle": geo["angle"],
                         "scale": geo["scale"],
-                        "area_ratio": geo["area_ratio"],
+                        "line_height_px": geo["line_height_px"],
+                        "line_height_ratio": geo["line_height_ratio"],
+                        "n_lines": geo["n_lines"],
                         "bbox": bbox,
                         "segmentation": rle,
                         "score": round(score, 4),
